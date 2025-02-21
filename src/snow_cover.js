@@ -1,5 +1,4 @@
-// Define area of interest (example coordinates)
-var geometry = ee.Geometry.Rectangle([-71.71782, -32.28247, -69.809361	, -29.0366]);
+var geometry = ee.Geometry.Rectangle([-71.71782, -32.28247, -69.809361, -29.0366]);
 
 // Load Landsat 8 TOA imagery for the same date range and area
 var landsat8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_TOA')
@@ -24,14 +23,14 @@ var viirs = ee.ImageCollection('NOAA/VIIRS/001/VNP09GA')
 var image = viirs.median().clip(geometry);
 
 // Calculate NDSI using I1 (visible) and I3 (SWIR)
-var ndsi = image.normalizedDifference(['I1', 'I3'])
-  .rename('NDSI');
+var ndsi = image.normalizedDifference(['I1', 'I3']).rename('NDSI');
 
-// Create snow cover mask (threshold 0.4)
-var snowCover = ndsi.gt(0.4);
+// Use the QF2 band (cast to integer) and check Bit 5 (value 32)
+var qf2 = image.select('QF2').toInt();
+var snowFlag = qf2.bitwiseAnd(32).gt(0); // Bit 5: 0 => no snow/ice; 1 => snow/ice
 
-// Visualization
-Map.centerObject(geometry, 8);
-//Map.addLayer(ndsi, {min: 0.4, max: 1, palette: ['blue', 'white']}, 'NDSI');
+// Create combined snow cover mask (threshold 0.4 and flag condition)
+var snowCover = ndsi.gt(0.4).and(snowFlag);
+
+// Visualization: add the snow cover mask layer
 Map.addLayer(snowCover.updateMask(snowCover), {palette: ['cyan']}, 'Snow Cover');
-
