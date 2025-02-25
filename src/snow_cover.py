@@ -1,4 +1,4 @@
-from earthaccess import Auth, Store
+from earthaccess import Store
 import earthaccess
 import xarray as xr
 import requests
