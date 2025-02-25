@@ -27,10 +27,18 @@ var ndsi = image.normalizedDifference(['I1', 'I3']).rename('NDSI');
 
 // Use the QF2 band (cast to integer) and check Bit 5 (value 32)
 var qf2 = image.select('QF2').toInt();
-var snowFlag = qf2.bitwiseAnd(32).gt(0); // Bit 5: 0 => no snow/ice; 1 => snow/ice
+var snowFlag2 = qf2.bitwiseAnd(32).gt(0); // Bit 5 flag from QF2
 
-// Create combined snow cover mask (threshold 0.4 and flag condition)
-var snowCover = ndsi.gt(0.4).and(snowFlag);
+// Use the QF7 band (cast to integer) and check Bit 0 (value 1) and Bit 5 (value 32)
+var qf7 = image.select('QF7').toInt();
+var snowFlag7 = qf7.bitwiseAnd(1).gt(0)         // Bit 0: snow present
+                  .or(qf7.bitwiseAnd(32).gt(0));   // Bit 5: snow/ice
+
+// Combine the flags from QF2 and QF7
+var combinedSnowFlag = snowFlag2;
+
+// Create combined snow cover mask using NDSI threshold and flags
+var snowCover = ndsi.gt(0).and(combinedSnowFlag);
 
 // Visualization: add the snow cover mask layer
 Map.addLayer(snowCover.updateMask(snowCover), {palette: ['cyan']}, 'Snow Cover');
