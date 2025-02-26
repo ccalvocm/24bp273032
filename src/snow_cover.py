@@ -56,14 +56,7 @@ for granule in results:
       x_dim, y_dim = get_coords(data_bytes)
       ds = ds.assign_coords(x=x_dim, y=y_dim)
       ds=ds.rio.write_crs(sinusoidal_crs, inplace=True)
-      ds = ds.rio.reproject("EPSG:32719")
-
-    #   ds = ds.rename({'x': 'y_temp', 'y': 'x'})
-    #   ds = ds.rename({'y_temp': 'y'})
-    #   ds = ds.transpose('band', 'y', 'x')
       ds_list.append(ds)
-    #   ds_utm.plot()
-    #   ds_utm.rio.to_raster(f"test_granule.tif")
 
   except Exception as e:
       print(f"Error processing {url}: {e}")
@@ -73,14 +66,8 @@ for granule in results:
 # Now merge the arrays
 
 mosaic_da = merge_arrays(ds_list)
-mosaic_da.rio.to_raster("mosaic.tif")
-mosaic_da = xr.DataArray(
-    mosaic_da,
-    dims=("band", "y", "x")
-)
-mosaic_da.rio.write_transform(mosaic_transform, inplace=True)
+mosaic_utm = mosaic_da.rio.reproject("EPSG:32719")
+mosaic_utm.plot()
+# mosaic_da.rio.to_raster("mosaic.tif")
 
 # Set CRS and reproject as needed.
-
-
-mosaic_utm.plot()
