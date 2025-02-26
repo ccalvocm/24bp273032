@@ -4,7 +4,6 @@ from io import BytesIO
 import rioxarray
 import h5py
 from rioxarray.merge import merge_arrays
-import numpy as np
 
 def get_coords(data_bytes):
     with h5py.File(data_bytes, 'r') as f:
