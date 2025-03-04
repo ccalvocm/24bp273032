@@ -1,0 +1,4 @@
+*.gpkg
+src/clipped_2022-09-29.tif
+src/mosaic_utm.nc
+src/mosaic.tif.aux.xml

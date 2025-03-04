@@ -4,6 +4,8 @@ from io import BytesIO
 import rioxarray
 import h5py
 from rioxarray.merge import merge_arrays
+import numpy as np
+import geopandas as gpd
 
 def get_coords(data_bytes):
     with h5py.File(data_bytes, 'r') as f:
@@ -46,19 +48,73 @@ def process_results(results, session):
     return ds_list
         
 def mosaic(ds_list):
-        
-def mosaic(ds_list):
     mosaic_da = merge_arrays(ds_list)
     mosaic_utm = mosaic_da.rio.reproject("EPSG:32719")
     return mosaic_utm
+
+def plot(mosaic_utm):
+    mosaic_utm.data = mosaic_utm.data.astype(float)
+    mosaic_utm.data[mosaic_utm.data > 1] = np.nan
+    mosaic_utm.plot(vmin=0, vmax=1)
+    return None
+
+def load_basins():
+    path=os.path.join('..','geodata',
+    'Cuencas_DARH_Coquimbo.gpkg')
+    gdf=gpd.read_file(path)
+    return gdf
+
+def clip_image(ds, basins, out_path=None):
+    """
+    Clip the input raster (ds) using the union of the basin geometries.
+    
+    Parameters:
+        ds (xarray.DataArray): The input raster.
+        basins (GeoDataFrame): Basin polygons.
+        out_path (str, optional): File path to save the clipped image.
+        
+    Returns:
+        Clipped xarray.DataArray.
+    """
+    # Create a union of all basin polygons
+    basins_union = basins.unary_union
+    
+    # Clip the dataset using the union geometry
+    ds_clipped = ds.rio.clip([basins_union], basins.crs, drop=True)
+
+    return ds_clipped
 
 def main():
     # Define search parameters
     short_name = "VNP10A1"
     version = "2"
-    temporal=("2022-09-29","2022-09-30")
+    date_list = ["2022-09-29", "2022-09-30", "2022-10-01"]
     bounding_box = (-71.71782, -32.28247, -69.809361,
                     -29.0366)  # Global coverage
+    for t in date_list:
+        temporal = (t, t)  # Query exactly one day
+        print(f"Processing date: {t}")
+
+        results = earthaccess.search_data(
+            short_name=short_name,
+            version=version,
+            temporal=temporal,
+            bounding_box=bounding_box
+        )
+
+        ds_list = process_results(results, session)
+        # Create mosaic from the day's granules
+        mosaic_utm = mosaic(ds_list)
+
+        # Optionally save the day's mosaic before clipping (commented out)
+        # mosaic_utm.to_netcdf(f"mosaic_{t}.nc")
+
+        # Clip the mosaic using basins
+        clipped_ds = clip_image(mosaic_utm, basins)
+
+
+
+
 
     results = earthaccess.search_data(
         short_name=short_name,
@@ -69,7 +125,12 @@ def main():
     session = authy()
     ds_list = process_results(results, session)
     mosaic_utm = mosaic(ds_list)
-    plot(mosaic_utm)
+    # mosaic_utm.to_netcdf('mosaic_utm.nc')
+    # plot(mosaic_utm)
+    basins=load_basins()
+    clipped_ds = clip_image(mosaic_utm,basins)
+
+
 
 if __name__ == "__main__":
     main()
