@@ -6,8 +6,12 @@ import h5py
 from rioxarray.merge import merge_arrays
 import numpy as np
 import geopandas as gpd
-import concurrent.futures
 import os
+import warnings
+from scipy.interpolate import NearestNDInterpolator
+import xarray as xr 
+# Suppress all warnings
+warnings.filterwarnings("ignore")
 
 def get_coords(data_bytes):
     with h5py.File(data_bytes, 'r') as f:
@@ -114,6 +118,68 @@ def filter_snow(ds, no_snow):
     ds.values = valores_today
     return ds
 
+def filter_clouds(ds):
+    values=ds.values
+    values = np.where(values == 250, np.nan, values)
+    ds.values = values
+    return ds
+
+def interpolate(ds):
+    """
+    Fast interpolation of missing values using SciPy's LinearNDInterpolator.
+    
+    Parameters:
+      ds (rioxarray.DataArray): Input DataArray.
+    
+    Returns:
+      rioxarray.DataArray: Interpolated DataArray.
+    """
+    # Remove all singleton dimensions with a view (non-copying operation)
+    ds_2d = ds.squeeze()
+    
+    # Access data directly with views instead of copies
+    Z = ds_2d.data
+    
+    # Only proceed with interpolation if there are NaN         
+    # Get coordinates - using data instead of values for speed
+    x = ds_2d['x'].data
+    y = ds_2d['y'].data
+    
+    # Use efficient masking to identify valid points
+    valid_mask = ~np.isnan(Z)
+        
+    # Optimize point collection for large arrays
+    # Pre-allocate arrays instead of using column_stack for large datasets
+    # Build meshgrid only once
+    X, Y = np.meshgrid(x, y, indexing='xy')
+    
+    # Pre-allocate points array for valid coordinates
+    num_valid = valid_mask.sum()
+    pts = np.empty((num_valid, 2), dtype=np.float64)
+    pts[:, 0] = X[valid_mask]
+    pts[:, 1] = Y[valid_mask]
+    
+    # Get valid values directly 
+    vals = Z[valid_mask]
+    
+    # Configure interpolator for better performance
+    interpolator = NearestNDInterpolator(
+        pts, 
+        vals
+        # NearestNDInterpolator doesn't accept fill_value or rescale parameters
+    )
+    
+    # Apply interpolation - directly reshape the output for efficiency
+    Z_interp = interpolator(X, Y)
+    
+    # Create output with minimal copying
+    ds_2d.data = Z_interp
+
+    # Preserve CRS with single call (write_crs returns a new object)
+    ds_2d = ds_2d.rio.write_crs(ds_2d.rio.crs)
+
+    return ds_2d
+
 def main():
     # Define search parameters
     short_name = "VNP10A1"
@@ -158,27 +224,38 @@ def main():
 
         lista.append(clipped_ds.copy())
 
+lista_backup=lista.copy()
+range_limit = 30
 
-
-
-            
-        for i in range(1, len(lista) - 1):
-            lista[i]=filter_snow(lista[i],no_snow)
+# Iterate over each entry in the list, excluding the first and last
+for i in range(1, len(lista) - 1):
+    # Apply filter_snow to the current entry
+    lista[i] = filter_snow(lista[i], no_snow)
+    
+    # Iterate over the range of previous entries
+    for j in range(1, range_limit + 1):
+        if i - j >= 0:
             try:
-                prev=lista[i-1]
-                lista[i]=fill_nosnow(lista[i],prev,no_snow,unknown)
-                lista[i]=fill_snow(lista[i],prev,rango,unknown)
-            except:
-                pass
+                prev = lista[i - j]
+                lista[i] = fill_nosnow(lista[i], prev, no_snow, unknown)
+                lista[i] = fill_snow(lista[i], prev, rango, unknown)
+            except Exception as e:
+                print(f"Error processing previous entry {i - j}: {e}")
+    
+    # Iterate over the range of posterior entries
+    for j in range(1, range_limit + 1):
+        if i + j < len(lista):
             try:
-                next=lista[i+1]
-                lista[i]=fill_nosnow(lista[i],next,no_snow,unknown)
-                lista[i]=fill_snow(lista[i],next,rango,unknown)
-            except:
-                pass
+                next = lista[i + j]
+                lista[i] = fill_nosnow(lista[i], next, no_snow, unknown)
+                lista[i] = fill_snow(lista[i], next, rango, unknown)
+            except Exception as e:
+                print(f"Error processing posterior entry {i + j}: {e}")
 
+lista2=list(map(filter_clouds,lista))
+lista3=list(map(interpolate,lista2))
 
-lista[1].rio.to_raster(f"today_correct_revB.tif")
+lista3[10].rio.to_raster(f"today_correct_revG.tif")
 
 
 
