@@ -118,7 +118,8 @@ def main():
     # Define search parameters
     short_name = "VNP10A1"
     version = "2"
-    date_list = ["2022-09-29", "2022-09-30", "2022-10-01"]
+    date_list = pd.date_range('2022-09-01',
+    '2022-09-30', freq='D')
     bounding_box = (-71.71782, -32.28247, -69.809361,
                     -29.0366)  # Global coverage
     no_snow = [211, 237, 239, 251, 252,253]
@@ -126,8 +127,7 @@ def main():
     rango=list(range(101))
     session = authy()
     basins=load_basins()
-
-    lista=[None,None,None]
+    lista=[]
     for ind,t in enumerate(date_list):
         temporal = (t, t)  # Query exactly one day
         print(f"Processing date: {t}")
@@ -156,14 +156,30 @@ def main():
 
         # Use the .where method to keep original values where condition is False, and set to 0 otherwise.
 
-        lista[ind]=clipped_ds.copy()
+        lista.append(clipped_ds.copy())
 
-        lista[-2]=fill_nosnow(lista[-2],lista[-3],no_snow,unknown)
-        lista[-2]=fill_nosnow(lista[-2],lista[-1],no_snow,unknown)
-        lista[-2]=fill_snow(lista[-2],lista[-3],rango,unknown)
-        lista[-2]=fill_snow(lista[-2],lista[-1],rango,unknown)
-        lista[-2]=filter_snow(lista[-2],no_snow)
-        lista[-2].rio.to_raster("today_correct_new.tif")
+
+
+
+            
+        for i in range(1, len(lista) - 1):
+            lista[i]=filter_snow(lista[i],no_snow)
+            try:
+                prev=lista[i-1]
+                lista[i]=fill_nosnow(lista[i],prev,no_snow,unknown)
+                lista[i]=fill_snow(lista[i],prev,rango,unknown)
+            except:
+                pass
+            try:
+                next=lista[i+1]
+                lista[i]=fill_nosnow(lista[i],next,no_snow,unknown)
+                lista[i]=fill_snow(lista[i],next,rango,unknown)
+            except:
+                pass
+
+
+lista[1].rio.to_raster(f"today_correct_revB.tif")
+
 
 
 
