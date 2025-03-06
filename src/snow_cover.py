@@ -124,6 +124,61 @@ def filter_clouds(ds):
     ds.values = values
     return ds
 
+
+def interpolate_linear(ds):
+    """
+    Fast interpolation of missing values using SciPy's LinearNDInterpolator.
+    
+    Parameters:
+      ds (rioxarray.DataArray): Input DataArray.
+    
+    Returns:
+      rioxarray.DataArray: Interpolated DataArray.
+    """
+    # Remove all singleton dimensions with a view (non-copying operation)
+    ds_2d = ds.squeeze()
+    
+    # Access data directly with views instead of copies
+    Z = ds_2d.data
+    
+    # Only proceed with interpolation if there are NaN         
+    # Get coordinates - using data instead of values for speed
+    x = ds_2d['x'].data
+    y = ds_2d['y'].data
+    
+    # Use efficient masking to identify valid points
+    valid_mask = ~np.isnan(Z)
+        
+    # Optimize point collection for large arrays
+    # Pre-allocate arrays instead of using column_stack for large datasets
+    # Build meshgrid only once
+    X, Y = np.meshgrid(x, y, indexing='xy')
+    
+    # Pre-allocate points array for valid coordinates
+    num_valid = valid_mask.sum()
+    pts = np.empty((num_valid, 2), dtype=np.float64)
+    pts[:, 0] = X[valid_mask]
+    pts[:, 1] = Y[valid_mask]
+    
+    # Get valid values directly 
+    vals = Z[valid_mask]
+    
+    # Configure interpolator for better performance
+    interpolator = LinearNDInterpolator(
+        pts, 
+        vals,
+        fill_value=np.nan,  # Explicitly set fill_value
+        rescale=True        # Rescale points for better numerical stability
+    )
+    
+    # Apply interpolation - directly reshape the output for efficiency
+    Z_interp = interpolator(X, Y)
+    
+    # Create output with minimal copying
+    ds_2d.data = Z_interp
+
+    return ds_2d
+
 def interpolate(ds):
     """
     Fast interpolation of missing values using SciPy's LinearNDInterpolator.
