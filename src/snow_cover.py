@@ -43,7 +43,9 @@ def process_results(results, session):
             data_bytes = BytesIO(mem)
             # Open the dataset
             ds = rioxarray.open_rasterio(data_bytes, engine='h5netcdf')
-            ds = ds.HDFEOS_GRIDS_VIIRS_Grid_IMG_2D_Data_Fields_NDSI
+            ds = ds.HDFEOS_GRIDS_VIIRS_Grid_IMG_2D_Data_Fields_NDSI_Snow_Cover
+            # ds.HDFEOS_GRIDS_VIIRS_Grid_IMG_2D_Data_Fields_Basic_QA
+
             # Rewind to extract coordinates without creating a new BytesIO object
             data_bytes.seek(0)
             x_dim, y_dim = get_coords(data_bytes)
@@ -91,6 +93,27 @@ def clip_image(ds, basins, out_path=None):
 
     return ds_clipped
 
+def fill_nosnow(ds,ds_other,no_snow,unknown):
+    values=ds.values
+    values_other=ds_other.values
+    mask=ds.isin(unknown)
+    values[mask] = np.where(np.isin(values_other[mask], no_snow), 0, values[mask])
+    return ds
+
+def fill_snow(ds,ds_other,rango,unknown):
+    values = ds.values
+    values_other = ds_other.values
+
+    mask = np.isin(values, unknown) & np.isin(values_other, rango)
+    values[mask] = values_other[mask]
+    return ds
+
+def filter_snow(ds, no_snow):
+    valores_today = ds.values
+    valores_today = np.where(np.isin(valores_today, no_snow), 0, valores_today)
+    ds.values = valores_today
+    return ds
+
 def main():
     # Define search parameters
     short_name = "VNP10A1"
@@ -98,10 +121,14 @@ def main():
     date_list = ["2022-09-29", "2022-09-30", "2022-10-01"]
     bounding_box = (-71.71782, -32.28247, -69.809361,
                     -29.0366)  # Global coverage
+    no_snow = [211, 237, 239, 251, 252,253]
+    unknown = [201,250,254,255]
+    rango=list(range(101))
     session = authy()
     basins=load_basins()
 
-    for t in date_list:
+    lista=[None,None,None]
+    for ind,t in enumerate(date_list):
         temporal = (t, t)  # Query exactly one day
         print(f"Processing date: {t}")
 
@@ -122,6 +149,23 @@ def main():
         # Clip the mosaic using basins
         clipped_ds = clip_image(mosaic_utm, basins)
         # get clipped_ds resolution
+        # get unique values of dataset
+
+
+        # , 254, 255]
+
+        # Use the .where method to keep original values where condition is False, and set to 0 otherwise.
+
+        lista[ind]=clipped_ds.copy()
+
+        lista[-2]=fill_nosnow(lista[-2],lista[-3],no_snow,unknown)
+        lista[-2]=fill_nosnow(lista[-2],lista[-1],no_snow,unknown)
+        lista[-2]=fill_snow(lista[-2],lista[-3],rango,unknown)
+        lista[-2]=fill_snow(lista[-2],lista[-1],rango,unknown)
+        lista[-2]=filter_snow(lista[-2],no_snow)
+        lista[-2].rio.to_raster("today_correct_new.tif")
+
+
 
 
 

@@ -1,0 +1,20 @@
+<PAMDataset>
+  <Metadata>
+    <MDI key="flag_meanings">no_decision night lake ocean cloud missing_L1B_data cal_fail_L1B_data bowtie_trim L1B_fill</MDI>
+    <MDI key="flag_values">201 211 237 239 250 251 252 253 254</MDI>
+    <MDI key="key">0-100=NDSI snow, 201=no decision, 211=night, 237=inland water, 239=ocean, 250=cloud, 251=missing data, 252=L1B unusable, 253=bowtie trim, 254=L1B fill, 255=fill</MDI>
+    <MDI key="long_name">Snow cover by NDSI</MDI>
+    <MDI key="valid_range">0 100</MDI>
+  </Metadata>
+  <PAMRasterBand band="1">
+    <Description>Snow cover by NDSI</Description>
+    <Metadata>
+      <MDI key="STATISTICS_APPROXIMATE">YES</MDI>
+      <MDI key="STATISTICS_MAXIMUM">250</MDI>
+      <MDI key="STATISTICS_MEAN">27.312008863538</MDI>
+      <MDI key="STATISTICS_MINIMUM">0</MDI>
+      <MDI key="STATISTICS_STDDEV">70.11928358849</MDI>
+      <MDI key="STATISTICS_VALID_PERCENT">56.89</MDI>
+    </Metadata>
+  </PAMRasterBand>
+</PAMDataset>
