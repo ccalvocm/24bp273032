@@ -6,10 +6,13 @@ import h5py
 from rioxarray.merge import merge_arrays
 import numpy as np
 import geopandas as gpd
+import pandas as pd
 import os
 import warnings
 from scipy.interpolate import NearestNDInterpolator
+from scipy.interpolate import LinearNDInterpolator
 import xarray as xr 
+
 # Suppress all warnings
 warnings.filterwarnings("ignore")
 
@@ -124,6 +127,24 @@ def filter_clouds(ds):
     ds.values = values
     return ds
 
+def process_all(lista, no_snow, unknown, rango, range_limit=20):
+    n = len(lista)
+    for i in range(0,n):  # Process ALL elements (0 to n-1)
+        ds = lista[i]
+        # Apply filter first
+        ds = filter_snow(ds, no_snow)
+        # Iterate over adjacent entries up to range_limit away
+        for j in range(1, range_limit + 1):
+            # Process previous entries if available
+            if i - j >= 0:
+                ds = fill_nosnow(ds, lista[i - j], no_snow, unknown)
+                ds = fill_snow(ds, lista[i - j], rango, unknown)
+            # Process posterior entries if available
+            if i + j < n:
+                ds = fill_nosnow(ds, lista[i + j], no_snow, unknown)
+                ds = fill_snow(ds, lista[i + j], rango, unknown)
+        lista[i] = ds
+    return lista
 
 def interpolate_linear(ds):
     """
@@ -230,9 +251,9 @@ def interpolate(ds):
     # Create output with minimal copying
     ds_2d.data = Z_interp
 
-    # Preserve CRS with single call (write_crs returns a new object)
-    ds_2d = ds_2d.rio.write_crs(ds_2d.rio.crs)
+    # fill nans with nearest value
 
+    # Preserve CRS with single call (write_crs returns a new object)
     return ds_2d
 
 def main():
@@ -264,59 +285,19 @@ def main():
         # Create mosaic from the day's granules
         mosaic_utm = mosaic(ds_list)
 
-        # Optionally save the day's mosaic before clipping (commented out)
-        # mosaic_utm.to_netcdf(f"mosaic_{t}.nc")
-
         # Clip the mosaic using basins
         clipped_ds = clip_image(mosaic_utm, basins)
         # get clipped_ds resolution
-        # get unique values of dataset
-
-
-        # , 254, 255]
-
-        # Use the .where method to keep original values where condition is False, and set to 0 otherwise.
 
         lista.append(clipped_ds.copy())
 
-lista_backup=lista.copy()
-range_limit = 30
+    lista1 = process_all(lista, no_snow, unknown, rango, range_limit=20)
 
-# Iterate over each entry in the list, excluding the first and last
-for i in range(1, len(lista) - 1):
-    # Apply filter_snow to the current entry
-    lista[i] = filter_snow(lista[i], no_snow)
-    
-    # Iterate over the range of previous entries
-    for j in range(1, range_limit + 1):
-        if i - j >= 0:
-            try:
-                prev = lista[i - j]
-                lista[i] = fill_nosnow(lista[i], prev, no_snow, unknown)
-                lista[i] = fill_snow(lista[i], prev, rango, unknown)
-            except Exception as e:
-                print(f"Error processing previous entry {i - j}: {e}")
-    
-    # Iterate over the range of posterior entries
-    for j in range(1, range_limit + 1):
-        if i + j < len(lista):
-            try:
-                next = lista[i + j]
-                lista[i] = fill_nosnow(lista[i], next, no_snow, unknown)
-                lista[i] = fill_snow(lista[i], next, rango, unknown)
-            except Exception as e:
-                print(f"Error processing posterior entry {i + j}: {e}")
+    lista2=list(map(filter_clouds,lista1))
+    lista3=list(map(interpolate,lista2))
 
-lista2=list(map(filter_clouds,lista))
-lista3=list(map(interpolate,lista2))
-
-lista3[10].rio.to_raster(f"today_correct_revG.tif")
-
-
-
-
-
-
+    lista1[0].rio.to_raster(f"today_correct_original.tif")
+    lista3[0].rio.to_raster(f"today_correct_filled.tif")
 
 if __name__ == "__main__":
     main()
