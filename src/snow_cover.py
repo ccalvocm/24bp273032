@@ -262,6 +262,7 @@ def main():
     version = "2"
     date_list = pd.date_range('2022-09-01',
     '2022-09-30', freq='D')
+    time_dim = len(date_list)
     bounding_box = (-71.71782, -32.28247, -69.809361,
                     -29.0366)  # Global coverage
     no_snow = [211, 237, 239, 251, 252,253]
@@ -269,8 +270,8 @@ def main():
     rango=list(range(101))
     session = authy()
     basins=load_basins()
-    lista=[]
-    for ind,t in enumerate(date_list):
+    first_ds = None
+    for t in date_list:
         temporal = (t, t)  # Query exactly one day
         print(f"Processing date: {t}")
 
@@ -287,9 +288,34 @@ def main():
 
         # Clip the mosaic using basins
         clipped_ds = clip_image(mosaic_utm, basins)
-        # get clipped_ds resolution
+        
+        # Squeeze out the 'band' dimension if present
+        if 'band' in clipped_ds.dims:
+            clipped_ds = clipped_ds.squeeze('band')
+        
+        if first_ds is None:
+            first_ds = clipped_ds
+            y_dim, x_dim = clipped_ds.shape[-2], clipped_ds.shape[-1]
+            empty_data = np.full((time_dim, y_dim, x_dim), np.nan, dtype=np.float32)
+            combined_ds = xr.DataArray(
+                empty_data,
+                coords={"time": date_list, "y": clipped_ds["y"], "x": clipped_ds["x"]},
+                dims=["time", "y", "x"]
+            )
+        
+        # Reindex clipped_ds to match the coordinates of combined_ds
+        clipped_ds = clipped_ds.reindex(y=combined_ds.y, x=combined_ds.x, method='nearest')
+        
+        # Assign the clipped DataArray to the corresponding time slice
+        combined_ds.loc[dict(time=t)] = clipped_ds
 
-        lista.append(clipped_ds.copy())
+
+    processed_slices = process_all([combined_ds.sel(time=t) for t in date_list], no_snow, unknown, rango, range_limit=20)
+
+    processed_ds = list(map(filter_clouds,processed_slices))
+    processed_ds = list(map(interpolate,processed_ds))
+
+    processed_da = xr.concat(processed_ds, dim="time")
 
     lista1 = process_all(lista, no_snow, unknown, rango, range_limit=20)
 
