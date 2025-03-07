@@ -309,21 +309,12 @@ def main():
         # Assign the clipped DataArray to the corresponding time slice
         combined_ds.loc[dict(time=t)] = clipped_ds
 
-
     processed_slices = process_all([combined_ds.sel(time=t) for t in date_list], no_snow, unknown, rango, range_limit=20)
 
     processed_ds = list(map(filter_clouds,processed_slices))
     processed_ds = list(map(interpolate,processed_ds))
 
     processed_da = xr.concat(processed_ds, dim="time")
-
-    lista1 = process_all(lista, no_snow, unknown, rango, range_limit=20)
-
-    lista2=list(map(filter_clouds,lista1))
-    lista3=list(map(interpolate,lista2))
-
-    lista1[0].rio.to_raster(f"today_correct_original.tif")
-    lista3[0].rio.to_raster(f"today_correct_filled.tif")
 
 if __name__ == "__main__":
     main()
