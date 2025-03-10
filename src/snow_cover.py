@@ -7,6 +7,7 @@ from rioxarray.merge import merge_arrays
 import numpy as np
 import geopandas as gpd
 import pandas as pd
+import datetime
 import os
 import warnings
 from scipy.interpolate import NearestNDInterpolator
@@ -258,10 +259,11 @@ def interpolate(ds):
 
 def main():
     # Define search parameters
+    today = datetime.date.today()
     short_name = "VNP10A1"
     version = "2"
-    date_list = pd.date_range('2022-09-01',
-    '2022-09-30', freq='D')
+    date_list=pd.date_range(today-pd.Timedelta('30D'), today,
+                             freq='D')
     time_dim = len(date_list)
     bounding_box = (-71.71782, -32.28247, -69.809361,
                     -29.0366)  # Global coverage
