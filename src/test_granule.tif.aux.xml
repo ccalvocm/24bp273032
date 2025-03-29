@@ -1,0 +1,21 @@
+<PAMDataset>
+  <Metadata>
+    <MDI key="flag_meanings">night ocean L1B_missing L1B_unusable bowtie_trim L1B_fill</MDI>
+    <MDI key="flag_values">21000 29000 24000 25000 31000 30000</MDI>
+    <MDI key="long_name">NDSI for all land and inland water pixels</MDI>
+    <MDI key="valid_range">-1000 1000</MDI>
+  </Metadata>
+  <PAMRasterBand band="1">
+    <Description>NDSI for all land and inland water pixels</Description>
+    <Scale>0.001000000047497451</Scale>
+    <Metadata>
+      <MDI key="STATISTICS_APPROXIMATE">YES</MDI>
+      <MDI key="STATISTICS_MAXIMUM">29000</MDI>
+      <MDI key="STATISTICS_MEAN">3093.4638616495</MDI>
+      <MDI key="STATISTICS_MINIMUM">-550</MDI>
+      <MDI key="STATISTICS_STDDEV">9039.9221243453</MDI>
+      <MDI key="STATISTICS_VALID_PERCENT">56.59</MDI>
+    </Metadata>
+  </PAMRasterBand>
+</PAMDataset>
+
