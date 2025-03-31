@@ -11,10 +11,9 @@ import geopandas as gpd
 # import landlab components
 from landlab import RasterModelGrid, imshow_grid
 from landlab.components.overland_flow import OverlandFlow
-from landlab.components.overland_flow import KinwaveImplicitOverlandFlow
 
 # Open raster image 
-rasterObj = rasterio.open('../Rst/DEMLimari500.tif')
+rasterObj = rasterio.open('../Rst/DEMLimari500Fill.tif')
 show(rasterObj)
 
 elevArray = rasterObj.read(1)
@@ -82,6 +81,8 @@ time_steps = 0
 rain_start = 0
 rain_end = 0.020/3600/24
 
+import time
+start_time = time.time()
 while elapsed_time < total_time:
     # Compute the current rainfall intensity as a linear function of elapsed time.
     # (Alternatively, adjust this calculation to your desired temporal evolution.)
@@ -99,6 +100,8 @@ while elapsed_time < total_time:
     
     print("Time step: %.2f seconds. Elapsed time %.2f seconds" % (of.dt, elapsed_time))
 
+end_time = time.time()
+print("Total elapsed time: %.2f seconds" % (end_time - start_time))
     # plot the resulting water depth for the 101th run
 imshow_grid(mg, "surface_water__depth", shrink=0.5,vmax=5)
 
