@@ -85,3 +85,88 @@ streams["Q_assigned_idw_weighted"] = idw_values
 
 # === 7. Save output ===
 streams.to_file("streams_idw_weighted.gpkg")
+
+import numpy as np
+import geopandas as gpd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+def nash_sutcliffe(obs, sim):
+    """
+    Nash–Sutcliffe Efficiency:
+      NSE = 1 - sum((obs - sim)^2) / sum((obs - mean(obs))^2)
+    """
+    num = np.sum((obs - sim) ** 2)
+    den = np.sum((obs - np.mean(obs)) ** 2)
+    return 1 - num/den if den != 0 else np.nan
+
+def evaluate_by_spatial_join(
+    streams,
+    glofas_gdf,
+    pred_col="Q_assigned_mfd_idw",
+    obs_col="Q",
+    max_dist=None
+):
+    """
+    Spatial‐join benchmark between streams (predictions) and GloFAS points (observations).
+    streams: GeoDataFrame with pred_col and geometry
+    glofas_gdf: GeoDataFrame with obs_col and geometry
+    """
+    # ensure the columns exist
+    for df, name, col in [
+        (streams, "streams", pred_col),
+        (glofas_gdf, "glofas_gdf", obs_col)
+    ]:
+        if col not in df.columns:
+            raise KeyError(f"'{col}' not in {name}.columns: {df.columns.tolist()}")
+
+    # prepare centroids for streams
+    s = streams.copy()
+    s["centroid"] = s.geometry.centroid
+    s = s.set_geometry("centroid")
+    # fill NaN predictions with zero
+    s[pred_col] = s[pred_col].fillna(0)
+
+    # ensure same CRS
+    g = glofas_gdf.copy()
+    g = g.set_crs(s.crs, allow_override=True)
+
+    # perform nearest‐neighbor spatial join
+    joined = gpd.sjoin_nearest(
+        s[[pred_col, s.geometry.name]],
+        g[[obs_col, g.geometry.name]],
+        how="inner",
+        distance_col="dist",
+        max_distance=max_dist
+    )
+    if joined.empty:
+        print(f"No matches within {max_dist}; aborting benchmark.")
+        return {"n_points": 0, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "NSE": np.nan}
+
+    # extract arrays and filter finite
+    y_pred = joined[pred_col].to_numpy()
+    y_obs  = joined[obs_col].to_numpy()
+    mask = np.isfinite(y_pred) & np.isfinite(y_obs)
+    y_pred, y_obs = y_pred[mask], y_obs[mask]
+    if len(y_obs) == 0:
+        print("No valid matched pairs after filtering.")
+        return {"n_points": 0, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "NSE": np.nan}
+
+    # compute metrics
+    mae  = mean_absolute_error(y_obs, y_pred)
+    rmse = mean_squared_error(y_obs, y_pred, squared=False)
+    r2   = r2_score(y_obs, y_pred)
+    nse  = nash_sutcliffe(y_obs, y_pred)
+    return {"n_points": len(y_obs), "MAE": mae, "RMSE": rmse, "R2": r2, "NSE": nse}
+
+# === after your IDW assignment ===
+# streams["Q_assigned_mfd_idw"] = idw_values
+
+# run benchmark
+metrics_idw = evaluate_by_spatial_join(
+    streams,
+    glofas_gdf,
+    pred_col="Q_assigned_idw_weighted",
+    obs_col="Q",
+    max_dist=max_dist
+)
+print("IDW benchmark metrics:", metrics_idw)
