@@ -15,7 +15,7 @@ accum_raster = "../Rst/flow_accumulation.tif"
 stream_file = "../geodata/riverQ.gpkg"
 target_crs = "EPSG:32719"
 p = 2  # IDW power parameter
-alpha = 0.5  # Flow accumulation weight exponent
+alpha = 0.25  # Flow accumulation weight exponent
 max_dist = 15000  # Max distance in meters for considering neighbors
 
 # === 1. Load GloFAS discharge and convert to grid polygons ===
