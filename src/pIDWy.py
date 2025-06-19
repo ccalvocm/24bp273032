@@ -15,7 +15,7 @@ ELEV_RASTER= "../Rst/dem90fill.tif"
 stream_file = "../geodata/riverQ.gpkg"
 target_crs = "EPSG:32719"
 p = 2  # IDW power parameter
-elev_weight = 0.8  # Elevation similarity weight factor
+elev_scale = 0.1  # Scale factor for elevation to match horizontal distance units
 max_dist = 15000  # Max distance in meters for considering neighbors
 
 # === 1. Load GloFAS discharge and convert to grid polygons ===
@@ -59,61 +59,78 @@ stream_coords = np.column_stack([targets.centroid.x, targets.centroid.y])
 with rasterio.open(ELEV_RASTER) as src:
     stream_elev = np.array([val[0] for val in src.sample(stream_coords)])
 
-# === 5. Build BallTree for efficient IDW ===
-tree = BallTree(np.vstack([glofas_gdf.geometry.x, glofas_gdf.geometry.y]).T, metric="euclidean")
-query_pts = np.vstack([targets.centroid.x, targets.centroid.y]).T
-dists, idxs = tree.query(query_pts, k=len(glofas_gdf))
+# === 5. Create 3D coordinates for BallTree ===
+# Scale elevation to match horizontal distance units
+glofas_coords_3d = np.column_stack([
+    glofas_gdf.geometry.x,
+    glofas_gdf.geometry.y,
+    glofas_gdf["elevation"] * elev_scale
+])
 
-# === 6. IDW with elevation weighting ===
-print("Performing IDW with elevation weighting...")
+stream_coords_3d = np.column_stack([
+    stream_coords[:, 0],
+    stream_coords[:, 1],
+    stream_elev * elev_scale
+])
 
-idw_values_elev = []
-for i, (d, ids) in enumerate(zip(dists, idxs)):
-    # Filter by distance
-    valid = d < max_dist
+# Build BallTree with 3D coordinates
+tree_3d = BallTree(glofas_coords_3d, metric="euclidean")
+
+# === 6. IDW with 3D distance ===
+print("Performing IDW with 3D distance...")
+
+idw_values_3d = []
+for i in range(len(stream_coords_3d)):
+    # Skip if target elevation is NaN
+    if np.isnan(stream_elev[i]):
+        # Fallback to 2D distance for this point
+        glofas_coords_2d = np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y])
+        tree_2d = BallTree(glofas_coords_2d, metric="euclidean")
+        d, ids = tree_2d.query([stream_coords[i]], k=len(glofas_gdf))
+        d = d[0]
+        ids = ids[0]
+    else:
+        # Use 3D distance
+        d, ids = tree_3d.query([stream_coords_3d[i]], k=len(glofas_gdf))
+        d = d[0]
+        ids = ids[0]
+    
+    # Filter by 2D distance for consistency (optional)
+    coords_2d_glofas = np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y])
+    coords_2d_neighbors = coords_2d_glofas[ids]
+    d_2d = np.sqrt(np.sum((coords_2d_neighbors - stream_coords[i]) ** 2, axis=1))
+    valid = d_2d < max_dist
+    
     if not np.any(valid):
-        idw_values_elev.append(0)
+        idw_values_3d.append(0)
         continue
     
-    d = d[valid]
-    ids = ids[valid]
-
-    # Get values for valid neighbors
-    q = glofas_gdf.iloc[ids]["Q"].values
-    elev_neighbors = glofas_gdf.iloc[ids]["elevation"].values
+    # Use 3D distances for weighting
+    d_3d = d[valid]
+    ids_valid = ids[valid]
     
-    # Get target elevation
-    elev_target = stream_elev[i]
+    # Get discharge values for valid neighbors
+    q = glofas_gdf.iloc[ids_valid]["Q"].values
     
-    # Skip if target elevation is NaN - fallback to standard IDW
-    if np.isnan(elev_target):
-        weights = 1.0 / (d ** p)
-        weights /= weights.sum()
-        q_interp = np.sum(weights * q)
-        idw_values_elev.append(q_interp)
-        continue
-    
-    # Calculate weights
-    # 1. Distance weights (standard IDW)
-    w_dist = 1.0 / (d ** p)
-    
-    # 2. Elevation similarity weights
-    elev_diff = np.abs(elev_neighbors - elev_target)
-    w_elev = 1.0 / (1.0 + elev_weight * elev_diff)
-    
-    # Combined weights (distance + elevation)
-    weights = w_dist * w_elev
+    # Calculate IDW weights using 3D distance
+    weights = 1.0 / (d_3d ** p)
     weights /= weights.sum()
     
     # Interpolated discharge
     q_interp = np.sum(weights * q)
-    idw_values_elev.append(q_interp)
+    idw_values_3d.append(q_interp)
 
 # === 7. Assign interpolated discharge to stream segments ===
-streams["Q_assigned_elev_idw"] = idw_values_elev
+streams["Q_assigned_3d_idw"] = idw_values_3d
 
 # === 8. Save output ===
-streams.to_file("streams_elev_idw.gpkg")
+# Clean the dataframe before saving
+streams_clean = streams.copy()
+if 'centroid' in streams_clean.columns:
+    streams_clean = streams_clean.drop(columns=['centroid'])
+
+streams_clean["Q_assigned_3d_idw"] = pd.to_numeric(streams_clean["Q_assigned_3d_idw"], errors='coerce')
+streams_clean.to_file("streams_3d_idw.gpkg", driver="GPKG")
 
 import numpy as np
 import geopandas as gpd
@@ -131,7 +148,7 @@ def nash_sutcliffe(obs, sim):
 def evaluate_by_spatial_join(
     streams,
     glofas_gdf,
-    pred_col="Q_assigned_elev_idw",
+    pred_col="Q_assigned_3d_idw",
     obs_col="Q",
     max_dist=None
 ):
@@ -185,14 +202,26 @@ def evaluate_by_spatial_join(
     nse  = nash_sutcliffe(y_obs, y_pred)
     return {"n_points": len(y_obs), "MAE": mae, "RMSE": rmse, "R2": r2, "NSE": nse}
 
-# === 9. Benchmark IDW with elevation ===
+# === 9. Benchmark 3D IDW ===
 print("\n=== BENCHMARK RESULTS ===")
 
-metrics_elev_idw = evaluate_by_spatial_join(
+metrics_3d_idw = evaluate_by_spatial_join(
     streams,
     glofas_gdf,
-    pred_col="Q_assigned_elev_idw",
+    pred_col="Q_assigned_3d_idw",
     obs_col="Q",
     max_dist=max_dist
 )
-print("IDW with elevation weighting:", metrics_elev_idw)
+print("3D IDW (using 3D distance):", metrics_3d_idw)
+
+# === 10. Additional statistics ===
+print("\n=== ADDITIONAL STATISTICS ===")
+q_pred = streams["Q_assigned_3d_idw"].dropna()
+print(f"Predicted discharge statistics:")
+print(f"  Min: {q_pred.min():.4f}")
+print(f"  Max: {q_pred.max():.4f}")
+print(f"  Mean: {q_pred.mean():.4f}")
+print(f"  Std Dev: {q_pred.std():.4f}")
+
+print(f"\nElev_scale parameter: {elev_scale}")
+print(f"This means 1m elevation difference = {elev_scale}m horizontal distance equivalent")

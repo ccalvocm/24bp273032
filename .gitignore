@@ -3,3 +3,7 @@ src/clipped_2022-09-29.tif
 src/mosaic_utm.nc
 src/mosaic.tif.aux.xml
 *.xml
+src/streams_idw_weighted.gpkg-shm
+src/streams_3d_idw.gpkg-wal
+src/streams_3d_idw.gpkg-shm
+src/streams_idw_weighted.gpkg-shm
