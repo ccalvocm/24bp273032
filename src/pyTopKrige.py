@@ -1,180 +1,228 @@
 import geopandas as gpd
 import rasterio
 import numpy as np
+import pandas as pd
 import xarray as xr
 from shapely.geometry import Point
 from sklearn.neighbors import BallTree
+from scipy.sparse import csc_matrix, eye
+from scipy.sparse.linalg import spsolve
+from collections import defaultdict
 import networkx as nx
+import matplotlib.pyplot as plt
 
 # === PARAMETERS ===
-GLOFAS_NC = "../Rst/GloFAS_2025_06_13_f.nc"
-VAR_NAME = "dis24"
+glofas_nc = "../Rst/GloFAS_2025_06_13_f.nc"
+var_name = "dis24"
 time_idx = 0
 accum_raster = "../Rst/flow_accumulation.tif"
-STREAM_FILE = "../geodata/riverQ.gpkg"
-ELEV_RASTER= "../Rst/dem90fill.tif"
-TARGET_CRS = "EPSG:32719"
-TIME_IDX = 0
-max_dist = 15000
-variogram_model = "exponential"
+flow_dir_raster = "../Rst/flowDir.tif"
+stream_file = "../geodata/riverQ.gpkg"
+target_crs = "EPSG:32719"
+max_dist = 15000  # Max distance in meters for considering neighbors
+variogram_model = "exponential"  # Can be "exponential", "gaussian", or "spherical"
 nugget = 0.1
-range_val = 50000
-sill = 1.0
+range_val = 50000  # Range parameter for variogram (in meters)
+sill = 1.0  # Sill parameter for variogram
 
 # === 1. Load GloFAS discharge and convert to points ===
-streams = gpd.read_file(STREAM_FILE).to_crs(TARGET_CRS)
+ds = xr.open_dataset(glofas_nc)
+dis = ds[var_name][time_idx, :, :].isel(forecast_period=0)
+if dis.ndim == 3:
+    dis2d = dis.isel(forecast_reference_time=0)  # or dis.mean(dim='time') or dis.isel(forecast_reference_time=0)
+else:
+    dis2d = dis
 
-# === 2. LOAD GLOFAS DATA AND CONVERT TO POINTS ===
-ds = xr.open_dataset(GLOFAS_NC)
-dis = ds[VAR_NAME][TIME_IDX, :, :]
-
-# If 3D, reduce to 2D
-while dis2d.ndim > 2:
-    dis2d = dis2d.isel({dim: 0 for dim in dis2d.dims if dim not in ['latitude', 'longitude']})
-
+# Create 2D coordinate grids using meshgrid
 lon2d, lat2d = np.meshgrid(dis2d.longitude.values, dis2d.latitude.values)
+
+# Create mask for valid values (must match dis2d.values shape)
 mask = (dis2d.values > 0) & np.isfinite(dis2d.values)
+
+# Now apply the mask to the 2D coordinate grids
 coords = np.column_stack((lon2d[mask], lat2d[mask]))
-Q_vals = dis2d.values[mask]
 
 glofas_gdf = gpd.GeoDataFrame(
-    {'Q': Q_vals},
+    {'Q': dis2d.values[mask]},
     geometry=gpd.points_from_xy(coords[:, 0], coords[:, 1]),
     crs="EPSG:4326"
-).to_crs(TARGET_CRS)
+).to_crs(target_crs)
 
-# === 3. EXTRACT COORDINATES AND VALUES ===
-coords = np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y])
-values = glofas_gdf['Q'].values
-stream_coords = np.column_stack([streams.geometry.centroid.x, streams.geometry.centroid.y])
+# === 2. Extract flow accumulation at GloFAS points ===
+with rasterio.open(accum_raster) as src:
+    glofas_gdf["flow_accum"] = [val[0] for val in src.sample(zip(glofas_gdf.geometry.x, glofas_gdf.geometry.y))]
+glofas_gdf["flow_accum"] = np.clip(glofas_gdf["flow_accum"].values, 1, None)
 
-# === 4. SAMPLE ELEVATION ===
-with rasterio.open(ELEV_RASTER) as src:
-    pts_elev = np.array([val[0] for val in src.sample(coords)])
-    stream_elev = np.array([val[0] for val in src.sample(stream_coords)])
+# === 3. Load stream segments and create river network graph ===
+streams = gpd.read_file(stream_file).to_crs(target_crs)
+if "segment_id" not in streams.columns:
+    streams["segment_id"] = streams.index.astype(str)
 
-print(f"GloFAS elevation NaNs: {np.isnan(pts_elev).sum()} / {len(pts_elev)}")
-print(f"Stream elevation NaNs: {np.isnan(stream_elev).sum()} / {len(stream_elev)}")
+# Create directed graph of river network
+G = nx.DiGraph()
+for idx, seg in streams.iterrows():
+    seg_id = seg['segment_id']
+    G.add_node(seg_id, geometry=seg.geometry, centroid=seg.geometry.centroid)
+    
+    # Add edges based on connectivity (simplified - should use actual topology)
+    # In practice, you should use the true network topology from your data
+    if idx > 0:
+        prev_id = streams.loc[idx-1, 'segment_id']
+        G.add_edge(prev_id, seg_id)
 
-# === 5. CLEAN DATA ===
-mask = (~np.isnan(values)) & (~np.isnan(pts_elev)) & (values > 0)
-coords_clean = coords[mask]
-values_clean = values[mask]
-elev_clean = pts_elev[mask]
+# Add distance attributes to edges
+for u, v in G.edges():
+    u_pt = G.nodes[u]['centroid']
+    v_pt = G.nodes[v]['centroid']
+    G.edges[u, v]['length'] = u_pt.distance(v_pt)
 
-print(f"Valid kriging points: {len(values_clean)}")
-print(f"Q variance: {np.var(values_clean):.3f}")
-print(f"Elevation variance: {np.var(elev_clean):.3f}")
-
-# === 6. UNIVERSAL KRIGING WITH EXTERNAL DRIFT ===
-kriging_success = False
-streams['Q_assigned_topkriging'] = np.nan
-
-if len(values_clean) < 10:
-    print("Too few valid points for Universal Kriging. Assigning mean Q.")
-    streams['Q_assigned_topkriging'] = np.mean(values_clean)
-else:
-    for model in ['exponential', 'gaussian', 'spherical']:
-        try:
-            print(f"Trying Universal Kriging with {model} variogram...")
-            uk = UniversalKriging(
-                coords_clean[:, 0], coords_clean[:, 1], values_clean,
-                variogram_model=model,
-                drift_terms=['external_Z'],
-                external_drift=elev_clean,
-                verbose=False
-            )
-            stream_mask = ~np.isnan(stream_elev)
-            z_uk, ss_uk = uk.execute(
-                'points',
-                stream_coords[stream_mask, 0],
-                stream_coords[stream_mask, 1],
-                stream_elev[stream_mask]
-            )
-            streams.loc[stream_mask, 'Q_assigned_topkriging'] = z_uk
-            print(f"Universal Kriging successful with {model}.")
-            kriging_success = True
-            break
-        except Exception as e:
-            print(f"Universal Kriging failed with {model}: {e}")
-
-if not kriging_success and len(values_clean) >= 10:
-    print("Falling back to Ordinary Kriging.")
+# === 4. Compute hydrological distances ===
+def compute_hydrological_distance(G, node1, node2):
+    """Compute hydrological distance between two nodes in the river network"""
     try:
-        ok = OrdinaryKriging(
-            coords_clean[:, 0], coords_clean[:, 1], values_clean,
-            variogram_model='exponential',
-            verbose=False
-        )
-        z_ok, ss_ok = ok.execute('points', stream_coords[:, 0], stream_coords[:, 1])
-        streams['Q_assigned_topkriging'] = z_ok
-        print("Ordinary Kriging fallback successful.")
-    except Exception as e:
-        print(f"Ordinary Kriging failed: {e}")
-        streams['Q_assigned_topkriging'] = np.mean(values_clean)
+        # Find path along the network
+        path = nx.shortest_path(G, node1, node2, weight='length')
+        dist = 0
+        for i in range(len(path)-1):
+            dist += G.edges[path[i], path[i+1]]['length']
+        return dist
+    except nx.NetworkXNoPath:
+        return float('inf')
 
-# === 7. OPTIONAL: ELEVATION-WEIGHTED IDW AS ALTERNATIVE ===
-def elevation_weighted_idw(coords_known, vals_known, elev_known, 
-                          coords_pred, elev_pred, k=8, power=2, elev_weight=0.5):
-    from scipy.spatial import cKDTree
-    tree = cKDTree(coords_known)
-    dist, idx = tree.query(coords_pred, k=min(k, len(coords_known)))
-    if dist.ndim == 1:
-        dist = dist.reshape(1, -1)
-        idx = idx.reshape(1, -1)
-    results = []
-    for i in range(len(coords_pred)):
-        d = np.maximum(dist[i], 1e-12)
-        w_dist = 1.0 / (d ** power)
-        elev_diff = np.abs(elev_known[idx[i]] - elev_pred[i])
-        w_elev = 1.0 / (1.0 + elev_weight * elev_diff)
-        w_total = w_dist * w_elev
-        w_norm = w_total / np.sum(w_total)
-        pred = np.sum(w_norm * vals_known[idx[i]])
-        results.append(pred)
-    return np.array(results)
+# === 5. Variogram functions ===
+def exponential_variogram(h, nugget, range_val, sill):
+    return nugget + sill * (1 - np.exp(-h / range_val))
 
-streams['Q_elev_idw'] = elevation_weighted_idw(
-    coords_clean, values_clean, elev_clean,
-    stream_coords, stream_elev,
-    k=8, power=2, elev_weight=0.5
-)
+def gaussian_variogram(h, nugget, range_val, sill):
+    return nugget + sill * (1 - np.exp(-(h ** 2) / (range_val ** 2)))
 
-# === 8. BENCHMARKING ===
+def spherical_variogram(h, nugget, range_val, sill):
+    if h == 0:
+        return 0
+    elif h <= range_val:
+        return nugget + sill * (1.5 * (h / range_val) - 0.5 * (h / range_val) ** 3)
+    else:
+        return nugget + sill
+
+VARIOS = {
+    "exponential": exponential_variogram,
+    "gaussian": gaussian_variogram,
+    "spherical": spherical_variogram
+}
+
+# === 6. Top-kriging interpolation ===
+# Create BallTree for spatial indexing
+tree = BallTree(np.vstack([glofas_gdf.geometry.x, glofas_gdf.geometry.y]).T, metric="euclidean")
+
+# Prepare data structures
+seg_ids = list(G.nodes())
+topkrige_values = []
+
+for seg_id in seg_ids:
+    target_pt = G.nodes[seg_id]['centroid']
+    
+    # Find nearby GloFAS points
+    dists, idxs = tree.query([[target_pt.x, target_pt.y]], k=min(50, len(glofas_gdf)))
+    dists = dists[0]
+    idxs = idxs[0]
+    
+    valid = dists < max_dist
+    if not np.any(valid):
+        topkrige_values.append(0)
+        continue
+        
+    # Get valid points
+    valid_idxs = idxs[valid]
+    valid_dists = dists[valid]
+    points = glofas_gdf.iloc[valid_idxs]
+    
+    # Create covariance matrix
+    n = len(points)
+    C = np.zeros((n, n))
+    vario_func = VARIOS[variogram_model]
+    
+    # Fill covariance matrix
+    for i in range(n):
+        for j in range(i, n):
+            # Use hydrological distance if possible, else Euclidean
+            h_dist = valid_dists[i] + valid_dists[j]  # Simplified - should use actual hydrological distance
+            covar = sill - vario_func(h_dist, nugget, range_val, sill)
+            C[i, j] = covar
+            C[j, i] = covar
+    
+    # Add nugget to diagonal
+    C += nugget * np.eye(n)
+    
+    # Create right-hand side vector
+    b = np.zeros(n)
+    for i in range(n):
+        # Use hydrological distance to target
+        h_dist_target = valid_dists[i]  # Simplified
+        covar_target = sill - vario_func(h_dist_target, nugget, range_val, sill)
+        b[i] = covar_target
+    
+    # Solve kriging system
+    try:
+        weights = np.linalg.solve(C, b)
+        weights /= weights.sum()  # Ensure unbiasedness
+        q_pred = np.sum(weights * points["Q"].values)
+        topkrige_values.append(q_pred)
+    except np.linalg.LinAlgError:
+        topkrige_values.append(0)
+
+# === 7. Assign interpolated discharge to stream segments ===
+for i, seg_id in enumerate(seg_ids):
+    G.nodes[seg_id]["Q_topkrige"] = topkrige_values[i]
+
+# Transfer results to GeoDataFrame
+streams["Q_topkrige"] = [G.nodes[seg_id]["Q_topkrige"] for seg_id in streams["segment_id"]]
+
+# === 8. Save output ===
+streams.to_file("streams_topkrige.gpkg")
+
+# ...existing code...
+# --- Fast vectorized IDW (distance only) ---
+from scipy.spatial import cKDTree
+
+# Get coordinates
+stream_xy = np.column_stack([streams.geometry.centroid.x, streams.geometry.centroid.y])
+glofas_xy = np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y])
+glofas_q = glofas_gdf["Q"].values
+
+# Build KDTree for fast neighbor search
+tree = cKDTree(glofas_xy)
+dists, idxs = tree.query(stream_xy, k=8, distance_upper_bound=MAX_DIST)  # k=8 nearest neighbors
+
+# Compute IDW for each stream segment
+p = 2  # IDW power parameter
+idw_vals = np.zeros(len(streams))
+for i in range(len(streams)):
+    valid = np.isfinite(dists[i]) & (dists[i] < MAX_DIST)
+    if not np.any(valid):
+        idw_vals[i] = 0
+        continue
+    d = dists[i][valid]
+    q = glofas_q[idxs[i][valid]]
+    weights = 1.0 / (d ** p)
+    weights /= weights.sum()
+    idw_vals[i] = np.sum(weights * q)
+
+streams["Q_idw"] = idw_vals
+
+# --- Benchmark both methods ---
 def nash_sutcliffe(obs, sim):
     num = np.sum((obs - sim) ** 2)
     den = np.sum((obs - np.mean(obs)) ** 2)
     return 1 - num / den if den != 0 else np.nan
 
-def evaluate_by_spatial_join(
-    streams,
-    glofas_gdf,
-    pred_col="Q_assigned_topkriging",
-    obs_col="Q",
-    max_dist=MAX_DIST
-):
-    s = streams.copy()
-    s["centroid"] = s.geometry.centroid
-    s = s.set_geometry("centroid")
-    s[pred_col] = s[pred_col].fillna(0)
-    g = glofas_gdf.copy()
-    g = g.set_crs(s.crs, allow_override=True)
-    joined = gpd.sjoin_nearest(
-        s[[pred_col, s.geometry.name]],
-        g[[obs_col, g.geometry.name]],
-        how="inner",
-        distance_col="dist",
-        max_distance=max_dist
-    )
-    if joined.empty:
-        print(f"No matches within {max_dist}; aborting benchmark.")
-        return {"n_points": 0, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "NSE": np.nan}
-    y_pred = joined[pred_col].to_numpy()
-    y_obs = joined[obs_col].to_numpy()
-    mask = np.isfinite(y_pred) & np.isfinite(y_obs)
-    y_pred, y_obs = y_pred[mask], y_obs[mask]
+def evaluate_results(streams, glofas_gdf, pred_col, max_dist=MAX_DIST):
+    centroids = streams.geometry.centroid
+    tree = cKDTree(np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y]))
+    dists, idxs = tree.query(np.column_stack([centroids.x, centroids.y]))
+    valid = dists < max_dist
+    y_obs = glofas_gdf.iloc[idxs[valid]]["Q"].values
+    y_pred = streams.loc[valid, pred_col].values
     if len(y_obs) == 0:
-        print("No valid matched pairs after filtering.")
         return {"n_points": 0, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "NSE": np.nan}
     mae = mean_absolute_error(y_obs, y_pred)
     rmse = mean_squared_error(y_obs, y_pred, squared=False)
@@ -182,20 +230,9 @@ def evaluate_by_spatial_join(
     nse = nash_sutcliffe(y_obs, y_pred)
     return {"n_points": len(y_obs), "MAE": mae, "RMSE": rmse, "R2": r2, "NSE": nse}
 
+metrics_topkrige = evaluate_results(streams, glofas_gdf, pred_col="Q_topkrige")
+metrics_idw = evaluate_results(streams, glofas_gdf, pred_col="Q_idw")
+
 print("\n=== BENCHMARK RESULTS ===")
-metrics_topo = evaluate_by_spatial_join(
-    streams, glofas_gdf,
-    pred_col="Q_assigned_topkriging",
-    obs_col="Q", max_dist=MAX_DIST
-)
-print("Topological Kriging:", metrics_topo)
-
-metrics_elev_idw = evaluate_by_spatial_join(
-    streams, glofas_gdf,
-    pred_col="Q_elev_idw",
-    obs_col="Q", max_dist=MAX_DIST
-)
-print("Elevation-weighted IDW:", metrics_elev_idw)
-
-# === 9. SAVE OUTPUT ===
-streams.to_file("streams_topkrige_output.gpkg")
+print("Topological Kriging:", metrics_topkrige)
+print("IDW:", metrics_idw)

@@ -7,3 +7,5 @@ src/streams_idw_weighted.gpkg-shm
 src/streams_3d_idw.gpkg-wal
 src/streams_3d_idw.gpkg-shm
 src/streams_idw_weighted.gpkg-shm
+.DS_Store
+src/streams_topkrige.gpkg-wal
