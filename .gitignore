@@ -10,3 +10,10 @@ src/streams_idw_weighted.gpkg-shm
 .DS_Store
 src/streams_topkrige.gpkg-wal
 .DS_Store
+.DS_Store
+src/streams_3d_idw_optimized.gpkg-shm
+src/streams_3d_idw_optimized.gpkg-wal
+src/streams_enhanced_hydrologic_idw.gpkg-shm
+src/streams_enhanced_hydrologic_idw.gpkg-wal
+src/streams_fast_network.gpkg-shm
+src/streams_fast_network.gpkg-wal
