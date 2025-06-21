@@ -15,30 +15,36 @@ warnings.filterwarnings('ignore')
 
 # JIT-compiled functions for speed
 @jit(nopython=True)
-def compute_semivariance_fast(obs_vals):
-    """Fast semivariance computation using numba"""
+def compute_semivariance_vectorized(obs_vals):
+    """Vectorized semivariance computation"""
     n = len(obs_vals)
-    gamma_mat = np.zeros((n, n))
-    for i in prange(n):
-        for j in prange(n):
-            gamma_mat[i, j] = 0.5 * (obs_vals[i] - obs_vals[j])**2
+    # Broadcasting: obs_vals[:, None] - obs_vals[None, :] creates all pairwise differences
+    diff_matrix = obs_vals[:, None] - obs_vals[None, :]
+    gamma_mat = 0.5 * diff_matrix**2
     return gamma_mat
 
 @jit(nopython=True)
 def build_covariance_matrix_fast(n, dist_matrix, flow_conn, iw, params_up, params_down):
-    """Fast covariance matrix construction"""
-    C = np.zeros((n, n))
-    for i in prange(n):
-        for j in prange(n):
-            h = dist_matrix[i, j]
-            if not np.isnan(h):
-                # Upstream covariance
-                if flow_conn[i, j]:
-                    cov_up = params_up[1] - (params_up[0] + params_up[1] * (1 - np.exp(-h/params_up[2])) - params_up[0])
-                    C[i, j] += iw[i] * iw[j] * cov_up
-                # Downstream covariance
-                cov_down = params_down[1] - (params_down[0] + params_down[1] * (1 - np.exp(-h/params_down[2])) - params_down[0])
-                C[i, j] += cov_down
+    """Vectorized covariance matrix construction"""
+    n = dist_matrix.shape[0]
+    
+    # Vectorized exponential variogram computation
+    valid_mask = ~np.isnan(dist_matrix)
+    
+    # Upstream covariance (vectorized)
+    exp_up = np.exp(-dist_matrix / params_up[2])
+    cov_up = params_up[1] - (params_up[0] + params_up[1] * (1 - exp_up) - params_up[0])
+    cov_up = np.where(valid_mask, cov_up, 0.0)
+    
+    # Downstream covariance (vectorized)
+    exp_down = np.exp(-dist_matrix / params_down[2])
+    cov_down = params_down[1] - (params_down[0] + params_down[1] * (1 - exp_down) - params_down[0])
+    cov_down = np.where(valid_mask, cov_down, 0.0)
+    
+    # Combine using broadcasting
+    iw_matrix = iw[:, None] * iw[None, :]
+    C = cov_down + (iw_matrix * cov_up * flow_conn)
+    
     return C
 
 print("Loading data...")
@@ -60,9 +66,6 @@ lat = ds.latitude.values
 # Create coordinate pairs and filter NaN values
 dis2d = dis[0, 0, :, :]    # or whatever indices apply
 dis2d = np.squeeze(dis2d)
-if dis2d.ndim != 2:
-    raise ValueError(f"Expected 2D discharge, got {dis2d.ndim}D")
-
 # --- 2) Build lon/lat grids (must match dis2d) ---
 # If you have 1D lon, lat arrays:
 # lon_vals = ds.longitude.values
@@ -71,15 +74,8 @@ if dis2d.ndim != 2:
 lon2d, lat2d = np.meshgrid(lon, lat)
 
 # --- 3) Mask and extract valid points ---
-valid_mask = (~np.isnan(dis2d)) & (dis2d >= 0)  # Only values > 0.1 m³/s
-discharge_threshold = np.percentile(dis2d[~np.isnan(dis2d)], 100)  # Top 25%
-significant_mask = valid_mask & (dis2d >= discharge_threshold)
-# Use significant discharge points
-if np.sum(significant_mask) < 50:
-    print("Too few significant points, using all non-zero values")
-    mask = valid_mask
-else:
-    mask = significant_mask
+valid_mask = ~np.isnan(dis2d)  # Only values > 0.1 m³/s
+mask = valid_mask
 # Extract coordinates and values
 xs = lon2d[mask]
 ys = lat2d[mask]
@@ -94,43 +90,29 @@ obs_df = gpd.GeoDataFrame(
 
 print(f"Created {len(obs_df)} observations")
 
-# OPTIMIZATION: Subsample if too many points
-MAX_OBS = 1000  # Reduce for faster computation
-
 # SPATIAL FILTERING: Remove clustered points, keep diverse spatial coverage
-if len(obs_df) > 1000:
-    print("Applying spatial filtering to reduce clustering...")
-    
-    # Use spatial clustering to get well-distributed points
-    from sklearn.cluster import KMeans
-    
-    coords = np.vstack([(pt.x, pt.y) for pt in obs_df.geometry])
-    n_clusters = min(800, len(obs_df) // 2)  # Aim for ~800 well-distributed points
-    
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    clusters = kmeans.fit_predict(coords)
-    
-    # For each cluster, keep the point with highest discharge
-    selected_indices = []
-    for cluster_id in range(n_clusters):
-        cluster_mask = clusters == cluster_id
-        cluster_discharges = obs_df.loc[cluster_mask, 'discharge']
-        if len(cluster_discharges) > 0:
-            best_idx = cluster_discharges.idxmax()
-            selected_indices.append(best_idx)
-    
-    obs_df = obs_df.loc[selected_indices].reset_index(drop=True)
-    print(f"After spatial filtering: {len(obs_df)} observations")
+print("Applying spatial filtering to reduce clustering...")
 
-# Additional quality filter: Remove extreme outliers
-# Q1 = obs_df['discharge'].quantile(0.25)
-# Q3 = obs_df['discharge'].quantile(0.75)
-# IQR = Q3 - Q1
-# lower_bound = Q1 - 15 * IQR
-# upper_bound = Q3 + 15 * IQR
+# Use spatial clustering to get well-distributed points
+from sklearn.cluster import KMeans
 
-# outlier_mask = (obs_df['discharge'] >= lower_bound) & (obs_df['discharge'] <= upper_bound)
-# obs_df = obs_df[outlier_mask].reset_index(drop=True)
+coords = np.vstack([(pt.x, pt.y) for pt in obs_df.geometry])
+n_clusters = len(obs_df)//2   # Aim for ~800 well-distributed points
+
+kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+clusters = kmeans.fit_predict(coords)
+
+# For each cluster, keep the point with highest discharge
+selected_indices = []
+for cluster_id in range(n_clusters):
+    cluster_mask = clusters == cluster_id
+    cluster_discharges = obs_df.loc[cluster_mask, 'discharge']
+    if len(cluster_discharges) > 0:
+        best_idx = cluster_discharges.idxmax()
+        selected_indices.append(best_idx)
+
+obs_df = obs_df.loc[selected_indices].reset_index(drop=True)
+print(f"After spatial filtering: {len(obs_df)} observations")
 
 print(f"After outlier removal: {len(obs_df)} observations")
 print(f"Final discharge range: {obs_df['discharge'].min():.2f} to {obs_df['discharge'].max():.2f} m³/s")
@@ -169,41 +151,20 @@ for idx, geom in enumerate(network.geometry):
         
     # Handle different geometry types
     lines = []
-    if geom.geom_type == 'LineString':
-        lines = [geom]
-    elif geom.geom_type == 'MultiLineString':
-        lines = list(geom.geoms)
-    elif geom.geom_type == 'Polygon':
-        # Use exterior boundary of polygon
-        lines = [geom.exterior]
-    elif geom.geom_type == 'MultiPolygon':
-        # Use exterior of each polygon
-        lines = [poly.exterior for poly in geom.geoms]
-    else:
-        # For any other type, just use the centroid
-        pred_points.append(geom.centroid)
-        continue
+    lines = [geom.exterior]
 
     # Sample points along each line
     for line in lines:
-        try:
-            length = line.length
-            if length <= 0:
-                continue
-                
-            # Always get at least 2 points (start and end)
-            n_points = max(2, int(np.ceil(length / interval)) + 1)
-            distances = np.linspace(0, length, n_points)
+        length = line.length
             
-            for d in distances:
-                pt = line.interpolate(d)
-                if not pt.is_empty:
-                    pred_points.append(pt)
+        # Always get at least 2 points (start and end)
+        n_points = max(2, int(np.ceil(length / interval)) + 1)
+        distances = np.linspace(0, length, n_points)
+        
+        for d in distances:
+            pt = line.interpolate(d)
+            pred_points.append(pt)
                     
-        except Exception as e:
-            print(f"Warning: Failed to sample geometry {idx}: {e}")
-            # Fallback to centroid
-            pred_points.append(geom.centroid)
 
 print(f"Generated {len(pred_points)} raw prediction points")
 
