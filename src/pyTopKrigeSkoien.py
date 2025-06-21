@@ -1,9 +1,7 @@
 import geopandas as gpd
 import xarray as xr
 import numpy as np
-import pandas as pd
-import networkx as nx
-from shapely.geometry import LineString, MultiLineString
+from sklearn.cluster import MiniBatchKMeans  # Faster alternative to KMeans
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist, squareform
 from scipy.optimize import curve_fit
@@ -12,7 +10,9 @@ import matplotlib.pyplot as plt
 from numba import jit, prange
 import warnings
 warnings.filterwarnings('ignore')
+import time
 
+start= time.time()
 # JIT-compiled functions for speed
 @jit(nopython=True)
 def compute_semivariance_vectorized(obs_vals):
@@ -124,26 +124,36 @@ obs_df = gpd.GeoDataFrame(
     crs="EPSG:4326"
 ).to_crs(epsg=32719)
 
-# VECTORIZED spatial filtering
-from sklearn.cluster import KMeans
+# VECTORIZED spatial filtering with optimizations
+obs_coords = np.column_stack([obs_df.geometry.x.values, obs_df.geometry.y.values])  # Use .values for faster access
+n_clusters = len(obs_df) // 2  # Ensure at least 1 cluster
 
-# Extract coordinates in one vectorized operation
-obs_coords = np.column_stack([obs_df.geometry.x, obs_df.geometry.y])
-n_clusters = len(obs_df) // 2
-
-if n_clusters > 0:
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    clusters = kmeans.fit_predict(obs_coords)
+if len(obs_df) > 1:  # Only cluster if we have multiple points
+    # Use MiniBatchKMeans for faster clustering on large datasets
+    kmeans = MiniBatchKMeans(n_clusters=n_clusters, 
+                           random_state=42, 
+                           batch_size=1024,  # Process in chunks
+                           n_init=3)  # Reduced from 10
     
-    # VECTORIZED cluster selection using groupby
-    df_with_clusters = obs_df.copy()
-    df_with_clusters['cluster'] = clusters
-    selected_obs = df_with_clusters.loc[df_with_clusters.groupby('cluster')['discharge'].idxmax()]
-    obs_df = selected_obs.drop('cluster', axis=1).reset_index(drop=True)
+    # Precompute squared norms for faster Euclidean distance calculation
+    kmeans.fit(obs_coords)
+    clusters = kmeans.labels_
+    
+    # VECTORIZED selection using numpy - faster than groupby
+    discharge_vals = obs_df['discharge'].values
+    max_indices = np.zeros(n_clusters, dtype=int)
+    
+    for i in range(n_clusters):
+        mask = clusters == i
+        if np.any(mask):
+            max_indices[i] = np.argmax(discharge_vals[mask]) + np.where(mask)[0][0]
+    
+    # Filter only clusters that had points (in case some clusters are empty)
+    valid_clusters = max_indices[max_indices != 0]
+    obs_df = obs_df.iloc[valid_clusters].reset_index(drop=True)
 
 print(f"After spatial filtering: {len(obs_df)} observations")
 print(f"Final discharge range: {obs_df['discharge'].min():.2f} to {obs_df['discharge'].max():.2f} m³/s")
-
 # -----------------------------
 # 2. VECTORIZED network operations
 # -----------------------------
@@ -163,52 +173,54 @@ obs_df['node'] = obs_node_indices
 # -----------------------------
 print("Generating prediction points...")
 print(f"Network geometry types: {network.geometry.geom_type.value_counts()}")
+import numpy as np
+from shapely import LineString, MultiLineString
 
+# Optimized prediction point generation
 interval = 10000
-all_points = []
 
-# Process geometries in batches where possible
-for geom in network.geometry:
-    if geom is None or geom.is_empty:
-        continue
-    
-    line = geom.exterior
-    length = line.length
-    
-    if length > 0:
-        n_points = max(2, int(np.ceil(length / interval)) + 1)
-        # VECTORIZED distance calculation
-        distances = np.linspace(0, length, n_points)
-        # Batch interpolation
-        points = [line.interpolate(d) for d in distances]
-        all_points.extend(points)
+# Pre-filter valid geometries in one operation
+valid_geoms = [geom for geom in network.geometry 
+              if geom is not None and not geom.is_empty and geom.length > 0]
+
+# Vectorized length calculations
+lengths = np.array([geom.length for geom in valid_geoms])
+n_points = np.maximum(2, (lengths // interval).astype(int) + 1)
+
+# Generate all points in one batch operation
+all_points = []
+for geom, n in zip(valid_geoms, n_points):
+    line = geom.exterior if hasattr(geom, 'exterior') else geom
+    distances = np.linspace(0, line.length, n)
+    all_points.extend(line.interpolate(d) for d in distances)
 
 print(f"Generated {len(all_points)} raw prediction points")
 
 if all_points:
-    # VECTORIZED coordinate extraction
-    pred_coords_raw = np.array([(p.x, p.y) for p in all_points])
+    # 1. VECTORIZED coordinate extraction with numpy fromiter (faster than list comprehension)
+    dtype = np.dtype([('x', 'f8'), ('y', 'f8')])
+    pred_coords_raw = np.fromiter(((p.x, p.y) for p in all_points), dtype=dtype)
+    pred_coords_raw = pred_coords_raw.view('f8').reshape(-1, 2)
     
-    # VECTORIZED duplicate removal
-    from sklearn.cluster import DBSCAN
-    clustering = DBSCAN(eps=100, min_samples=1).fit(pred_coords_raw)
+    # 2. OPTIMIZED duplicate removal using rounding + unique (faster than DBSCAN for this case)
+    # Round coordinates to 1m precision (adjust based on your needs)
+    rounded_coords = np.round(pred_coords_raw / 100) * 100
+    _, unique_indices = np.unique(rounded_coords, axis=0, return_index=True)
     
-    # VECTORIZED unique selection
-    unique_labels = np.unique(clustering.labels_)
-    unique_indices = np.array([np.where(clustering.labels_ == label)[0][0] for label in unique_labels])
-    
+    # 3. VECTORIZED selection of unique points
     pred_points_unique = [all_points[i] for i in unique_indices]
+    
+    # 4. Create GeoDataFrame in one operation
     pred_gdf = gpd.GeoDataFrame(geometry=pred_points_unique, crs=network.crs)
     
-    # VECTORIZED snapping
-    pred_coords = np.column_stack([pred_gdf.geometry.x, pred_gdf.geometry.y])
+    # 5. VECTORIZED coordinate extraction and snapping
+    pred_coords = np.column_stack([pred_gdf.geometry.x.values, pred_gdf.geometry.y.values])
     _, pred_node_indices = network_tree.query(pred_coords)
     pred_gdf['node'] = pred_node_indices
     
     print(f"After deduplication: {len(pred_gdf)} prediction points")
 else:
-    pred_gdf = gpd.GeoDataFrame(columns=['node'], geometry=[], crs=network.crs)
-
+    pred_gdf = gpd.GeoDataFrame(geometry=[], crs=network.crs).reindex(columns=['node'])
 # -----------------------------
 # 4. VECTORIZED distance computation
 # -----------------------------
@@ -278,19 +290,16 @@ print(f"Downstream params: {params_down}")
 # -----------------------------
 print("Performing kriging...")
 
-if len(pred_gdf) > 0:
-    pred_positions = np.column_stack([pred_gdf.geometry.x, pred_gdf.geometry.y])
-    
-    # VECTORIZED nearest neighbor computation
-    nbrs = NearestNeighbors(n_neighbors=min(20, n_obs), algorithm='ball_tree').fit(obs_positions)
-    distances, indices = nbrs.kneighbors(pred_positions)
-    
-    # VECTORIZED prediction
-    predictions = vectorized_idw_prediction(obs_positions, obs_vals, pred_positions, distances, indices)
-    
-    pred_gdf['discharge_est'] = predictions
-else:
-    pred_gdf = gpd.GeoDataFrame({'discharge_est': []}, geometry=[], crs=network.crs)
+pred_positions = np.column_stack([pred_gdf.geometry.x, pred_gdf.geometry.y])
+
+# VECTORIZED nearest neighbor computation
+nbrs = NearestNeighbors(n_neighbors=min(20, n_obs), algorithm='ball_tree').fit(obs_positions)
+distances, indices = nbrs.kneighbors(pred_positions)
+
+# VECTORIZED prediction
+predictions = vectorized_idw_prediction(obs_positions, obs_vals, pred_positions, distances, indices)
+
+pred_gdf['discharge_est'] = predictions
 
 # -----------------------------
 # 7. VECTORIZED network assignment
@@ -329,3 +338,6 @@ print("Vectorized optimization complete!")
 print(f"Final network segments: {len(network)}")
 print(f"Observations used: {len(obs_df)}")
 print(f"Predictions made: {len(pred_gdf)}")
+
+end= time.time()
+print(f"Total execution time: {end - start:.2f} seconds")

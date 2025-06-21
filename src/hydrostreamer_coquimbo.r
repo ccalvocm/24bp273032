@@ -51,6 +51,8 @@ runoff_32719 <- projectRaster(
   crs    = st_crs(basins)$proj4string,
   method = "bilinear"
 )
+# divide runoff_32719 by 25000000
+runoff_32719 <- runoff_32719 / 25000000
 
 #plot(runoff_32719)
 # plot(basins)
@@ -79,6 +81,7 @@ aoi_geom <- st_as_sfc(st_bbox(basins), crs = st_crs(basins))
 aoi      <- st_sf(geometry = aoi_geom)
 # Use bounding box instead of union
 
+nc = nc_open("../Rst/GloFAS_2025_06_13_f.nc")
 # 2) Read the forecast reference time (global attribute)
 ref_secs   <- ncatt_get(nc, 0, "forecast_reference_time")$value
 start_date <- as.Date(as.POSIXct(ref_secs, origin="1970-01-01", tz="UTC"))
@@ -118,7 +121,6 @@ river2_buffered <- st_buffer(river2, dist = 500)  # 500 meters buffer
 river2 <- st_transform(river2, crs(runoff_32719))
 
 # Use buffered lines to get better spatial coverage
-river2_buffered <- st_buffer(river2, dist = 200)  # Smaller buffer
 river2$discharge_m3s <- raster::extract(runoff_32719, river2_buffered, fun = mean, na.rm = TRUE)
 
 summary(river2$discharge_m3s)
@@ -136,6 +138,7 @@ A2LDM <- interpolate_runoff(
 )
 
 A2LDM$mean_runoff <- sapply(A2LDM$runoff_ts, function(x) mean(x$LORA))
+A2LDM$mean_runoff <- A2LDM$mean_runoff * 25000000  # Adjust for scaling
 plot(A2LDM["mean_runoff"])
 
 # Check the results
