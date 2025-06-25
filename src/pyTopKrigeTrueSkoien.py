@@ -373,6 +373,10 @@ else:
 # -----------------------------
 print("Saving Top-kriging results...")
 
+import os
+if os.path.exists('riverQ_topKriging_skoeien.gpkg'):
+    os.remove('riverQ_topKriging_skoeien.gpkg')
+
 network.to_file('riverQ_topKriging_skoeien.gpkg', driver='GPKG')
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))

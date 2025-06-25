@@ -82,6 +82,9 @@ lon_name = [dim for dim in dis.dims if 'lon' in dim][0]
 lats = dis[lat_name].values
 lons = dis[lon_name].values
 
+dis.rio.write_crs("EPSG:4326", inplace=True)
+dis_utm=dis.rio.reproject(target_crs)
+
 # Build GloFAS points
 
 def build_glofas_gdf(dis, lats, lons, target_crs):
@@ -148,7 +151,6 @@ def extract_stream_elevations():
 stream_elev = extract_stream_elevations()
 # === 5. Create 3D coordinates for BallTree ===
 # Scale elevation to match horizontal distance units
-@time_section("3D Coordinate Preparation")
 def prepare_3d_coordinates():
     # Vectorized 3D coordinate creation
     glofas_coords_3d = np.column_stack([
@@ -289,7 +291,6 @@ def evaluate_results():
 
 metrics_3d_idw = evaluate_results()
 
-
 print("\n=== BENCHMARK RESULTS ===")
 print("3D IDW (optimized):", metrics_3d_idw)
 
@@ -306,3 +307,69 @@ print(f"\nElev_scale parameter: {elev_scale}")
 print(f"This means 1m elevation difference = {elev_scale}m horizontal distance equivalent")
 
 print("\n🚀 Optimization complete!")
+
+
+
+###### tests
+import geopandas as gpd
+import xarray as xr
+import numpy as np
+from rasterio.features import rasterize
+from rasterio.transform import from_bounds
+
+# Simple setup
+value_col = 'Q_assigned_3d_idw'
+res = 500
+
+# Get extent
+x_min, x_max = float(dis_utm.x.min()), float(dis_utm.x.max())
+y_min, y_max = float(dis_utm.y.min()), float(dis_utm.y.max())
+
+# Grid dimensions
+width = int(np.ceil((x_max - x_min) / res))
+height = int(np.ceil((y_max - y_min) / res))
+
+# Transform
+transform = from_bounds(x_min, y_min, x_max, y_max, width, height)
+
+# Filter valid streams
+valid_streams = streams_clean.dropna(subset=[value_col])
+print(f"Valid streams: {len(valid_streams)}")
+
+if len(valid_streams) == 0:
+    print("No valid streams found!")
+else:
+    # Prepare for rasterization - simple approach
+    shapes = [(geom, value) for geom, value in 
+              zip(valid_streams.geometry, valid_streams[value_col])]
+    
+    print(f"Rasterizing {len(shapes)} geometries...")
+    
+    # Simple rasterize call
+    raster = rasterize(
+        shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=np.nan,
+        dtype='float32',
+        all_touched=True  # This ensures lines get rasterized
+    )
+    
+    # Create coordinates
+    x_coords = np.linspace(x_min, x_max, width)
+    y_coords = np.linspace(y_max, y_min, height)
+    
+    # Make DataArray
+    da = xr.DataArray(
+        raster,
+        coords={'y': y_coords, 'x': x_coords},
+        dims=['y', 'x'],
+        name=value_col
+    )
+    
+    da.rio.write_crs(streams_clean.crs, inplace=True)
+    da.to_netcdf('streams_simple_500m.nc')
+    
+    print(f"Grid: {width}x{height}")
+    print(f"Valid pixels: {np.sum(~np.isnan(raster))}")
+    print("Done!")
