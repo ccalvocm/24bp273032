@@ -317,59 +317,45 @@ import numpy as np
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
 
-# Simple setup
-value_col = 'Q_assigned_3d_idw'
-res = 500
+def gdf2raster(gdf=streams_clean,
+                col='Q_assigned_3d_idw',
+                  res=500, fill=np.nan):
+    """    Convert a GeoDataFrame to a raster using a specified column for values.
+    Args:
+        gdf (GeoDataFrame): Input GeoDataFrame with geometries and values.
+        col (str): Column name in GeoDataFrame to use for raster values.
+        res (int): Resolution of the output raster in pixels.
+        fill (float): Value to fill empty pixels in the raster.
+    Returns:
+        xr.DataArray: Rasterized data as an xarray DataArray.
+    """
+    # Ensure the GeoDataFrame has the specified column
+    # Ultra-fast optimized
+    res, col = 500, col
+    x_min, x_max, y_min, y_max = dis_utm.x.min(), dis_utm.x.max(), dis_utm.y.min(), dis_utm.y.max()
+    width, height = int(np.ceil((x_max - x_min) / res)), int(np.ceil((y_max - y_min) / res))
 
-# Get extent
-x_min, x_max = float(dis_utm.x.min()), float(dis_utm.x.max())
-y_min, y_max = float(dis_utm.y.min()), float(dis_utm.y.max())
-
-# Grid dimensions
-width = int(np.ceil((x_max - x_min) / res))
-height = int(np.ceil((y_max - y_min) / res))
-
-# Transform
-transform = from_bounds(x_min, y_min, x_max, y_max, width, height)
-
-# Filter valid streams
-valid_streams = streams_clean.dropna(subset=[value_col])
-print(f"Valid streams: {len(valid_streams)}")
-
-if len(valid_streams) == 0:
-    print("No valid streams found!")
-else:
-    # Prepare for rasterization - simple approach
-    shapes = [(geom, value) for geom, value in 
-              zip(valid_streams.geometry, valid_streams[value_col])]
-    
-    print(f"Rasterizing {len(shapes)} geometries...")
-    
-    # Simple rasterize call
+    # Fixed rasterize call
+    valid = gdf.dropna(subset=[col])
     raster = rasterize(
-        shapes,
-        out_shape=(height, width),
-        transform=transform,
-        fill=np.nan,
-        dtype='float32',
-        all_touched=True  # This ensures lines get rasterized
+        shapes=[(g, v) for g, v in zip(valid.geometry, valid[col])], 
+        out_shape=(height, width), 
+        transform=from_bounds(x_min, y_min, x_max, y_max, width, height),
+        fill=np.nan, 
+        all_touched=True, 
+        dtype='float32'
     )
-    
-    # Create coordinates
-    x_coords = np.linspace(x_min, x_max, width)
-    y_coords = np.linspace(y_max, y_min, height)
-    
-    # Make DataArray
-    da = xr.DataArray(
-        raster,
-        coords={'y': y_coords, 'x': x_coords},
-        dims=['y', 'x'],
-        name=value_col
-    )
-    
-    da.rio.write_crs(streams_clean.crs, inplace=True)
-    da.to_netcdf('streams_simple_500m.nc')
-    
-    print(f"Grid: {width}x{height}")
-    print(f"Valid pixels: {np.sum(~np.isnan(raster))}")
-    print("Done!")
+
+    # Save
+    xr.DataArray(raster, coords={'y': np.linspace(y_max, y_min, height), 
+                                'x': np.linspace(x_min, x_max, width)}, 
+                dims=['y', 'x']).rio.write_crs(gdf.crs).to_netcdf('fast_500m.nc')
+    xr.DataArray(raster, coords={'y': np.linspace(y_max, y_min, height), 
+                                'x': np.linspace(x_min, x_max, width)}, 
+                dims=['y', 'x']).rio.write_crs(gdf.crs).plot()
+
+    print(f"✅ {np.sum(~np.isnan(raster))} pixels")
+
+gdf2raster(streams_clean,
+            col='Q_assigned_3d_idw',
+              res=500, fill=np.nan)
