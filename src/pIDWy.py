@@ -262,6 +262,8 @@ p = 2  # IDW power parameter
 elev_scale = 0.1  # Scale factor for elevation to match horizontal distance units
 max_dist = 15000  # Max distance in meters for considering neighbors
 
+ras_list = []
+# === 0. Setup ===
 # === 1. Load GloFAS discharge and convert to grid polygons ===
 ds = xr.open_dataset(glofas_nc)
 times = ds['time'].values
@@ -302,3 +304,12 @@ for time in times:
     ras = gdf2raster(streams_clean,
                 col=col,
                 res=500, fill=np.nan)
+
+    ras_list.append(ras)
+
+# === 9. Save results ===
+ras_combined = xr.concat(ras_list, dim='time')
+ras_combined = ras_combined.assign_coords(
+    time=pd.to_datetime(times)).rename({'time': 'time'})
+ras_combined.rio.write_crs(target_crs, inplace=True)
+ras_combined.to_netcdf("dis_3d_idw_optimized_1980_2018.nc")
