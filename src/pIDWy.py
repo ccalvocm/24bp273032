@@ -191,9 +191,8 @@ def compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf,
     return idw_values
 
 # === 7. Assign interpolated discharge to stream segments ===
-def assign_results(col="Q_assigned_3d_idw",
-                   idw_values_3d=None,
-                   streams=None):
+def assign_results(streams,col="Q_assigned_3d_idw",
+                   idw_values_3d=None):
     streams[col] = idw_values_3d
     
     # Clean and prepare for saving
@@ -237,7 +236,7 @@ def gdf2raster(gdf,
         shapes=[(g, v) for g, v in zip(valid.geometry, valid[col])], 
         out_shape=(height, width), 
         transform=from_bounds(x_min, y_min, x_max, y_max, width, height),
-        fill=np.nan, 
+        fill=0, 
         all_touched=True, 
         dtype='float32'
     )
@@ -252,7 +251,7 @@ def gdf2raster(gdf,
 
 # === PARAMETERS ===
 glofas_nc = "../Rst/GloFAS_2025_06_13_f.nc"
-glofas_nc='/Users/carlos/Downloads/dis_1980_2018_clip.nc'
+glofas_nc='../Rst/dis_1980_2018_clip.nc'
 var_name = "dis"
 time_idx = 0
 ELEV_RASTER= "../Rst/dem90fill.tif"
@@ -270,8 +269,8 @@ streams, stream_coords = load_stream_data(stream_file)
 
 for time in times:
     dis = ds[var_name].sel(time=time)
-    lat_name = [dim for dim in dis.dims if 'lat' in dim][0]
-    lon_name = [dim for dim in dis.dims if 'lon' in dim][0]
+    lat_name = [dim for dim in dis.dims if 'lat' in str(dim)][0]
+    lon_name = [dim for dim in dis.dims if 'lon' in str(dim)][0]
     lats = dis[lat_name].values
     lons = dis[lon_name].values
 
@@ -295,9 +294,8 @@ for time in times:
     idw_values_3d = compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf, 
                 stream_elev)
 
-    streams_clean = assign_results(col,
-                   idw_values_3d,
-                   streams)
+    streams_clean = assign_results(streams,col,
+                   idw_values_3d)
 
     ###### tests
 
