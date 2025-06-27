@@ -289,9 +289,7 @@ for time in times:
     # === 5. Create 3D coordinates for BallTree ===
     # Scale elevation to match horizontal distance units
 
-    glofas_coords_3d, stream_coords_3d = prepare_3d_coordinates(glofas_gdf, 
-                                                                stream_coords, 
-                                                                stream_elev)
+    glofas_coords_3d, stream_coords_3d = prepare_3d_coordinates(glofas_gdf, stream_coords, stream_elev)
 
     idw_values_3d = compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf, 
                 stream_elev)
