@@ -75,7 +75,7 @@ def train_quantile_delta_mapping(observed, simulated, n_quantiles=100):
     
     return correction_factors
 
-def interpolate_correction_factors_to_grid(station_coords, station_corrections, grid_coords, method='linear', smooth_sigma=2.0, max_change_factor=3.0):
+def interpolate_correction_factors_to_grid(station_coords, station_corrections, grid_coords, method='rbf', smooth_sigma=2.0, max_change_factor=3.0):
     """
     Interpolate station-based correction factors to full model grid with improvements
     Uses RBF or nearest neighbor to avoid TIN artifacts from linear interpolation
@@ -135,12 +135,7 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
         'obs_quantiles': np.zeros((len(grid_coords), n_quantiles)),
         'sim_quantiles': np.zeros((len(grid_coords), n_quantiles))
     }
-    
-    # USE RBF OR NEAREST NEIGHBOR TO AVOID TIN ARTIFACTS
-    if method == 'linear':
-        print("⚠️  Linear interpolation can cause TIN artifacts. Using RBF instead...")
-        method = 'rbf'
-    
+        
     print(f"Using {method} interpolation to avoid TIN artifacts...")
     
     # Interpolate each quantile level
@@ -345,7 +340,7 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
         corrected_valid = np.zeros_like(valid_forecast)
         
         for i in range(len(valid_forecast)):
-            # Linear interpolation for each point
+            # interpolation for each point
             try:
                 corrected_valid[i] = np.interp(
                     valid_forecast[i], 
