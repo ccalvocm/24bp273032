@@ -78,6 +78,7 @@ def train_quantile_delta_mapping(observed, simulated, n_quantiles=100):
 def interpolate_correction_factors_to_grid(station_coords, station_corrections, grid_coords, method='linear', smooth_sigma=2.0, max_change_factor=3.0):
     """
     Interpolate station-based correction factors to full model grid with improvements
+    Uses RBF or nearest neighbor to avoid TIN artifacts from linear interpolation
     
     Parameters:
     -----------
@@ -88,7 +89,7 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
     grid_coords : array
         Grid coordinates as [(x1,y1), (x2,y2), ...]
     method : str
-        Interpolation method ('linear', 'cubic', 'nearest')
+        Interpolation method ('rbf', 'nearest', 'linear')
     smooth_sigma : float
         Gaussian smoothing parameter (0 = no smoothing)
     max_change_factor : float
@@ -99,6 +100,7 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
     dict : Grid-based correction factors with artifacts reduced
     """
     from scipy.ndimage import gaussian_filter
+    from scipy.interpolate import Rbf
     
     print(f"Interpolating {len(station_corrections)} station corrections to {len(grid_coords)} grid points...")
     
@@ -111,7 +113,7 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
     quantile_levels = first_correction['quantile_levels']
     n_quantiles = len(quantile_levels)
     
-    # IMPROVEMENT 3: Add outlier detection and capping for station data
+    # IMPROVEMENT: Add outlier detection and capping for station data
     print("Detecting and capping outlier correction factors...")
     for station in valid_stations:
         obs_q = station_corrections[station]['obs_quantiles']
@@ -134,8 +136,12 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
         'sim_quantiles': np.zeros((len(grid_coords), n_quantiles))
     }
     
-    # IMPROVEMENT 1: Use linear interpolation with nearest neighbor fallback
-    print(f"Using {method} interpolation with nearest neighbor fallback...")
+    # USE RBF OR NEAREST NEIGHBOR TO AVOID TIN ARTIFACTS
+    if method == 'linear':
+        print("⚠️  Linear interpolation can cause TIN artifacts. Using RBF instead...")
+        method = 'rbf'
+    
+    print(f"Using {method} interpolation to avoid TIN artifacts...")
     
     # Interpolate each quantile level
     for i, q_level in enumerate(quantile_levels):
@@ -145,22 +151,23 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
         sim_q_values = np.array([station_corrections[station]['sim_quantiles'][i] 
                                 for station in valid_stations])
         
-        # Primary interpolation using specified method
         try:
-            grid_obs_q = griddata(station_xy, obs_q_values, grid_coords, 
-                                 method=method, fill_value=np.nan)
-            grid_sim_q = griddata(station_xy, sim_q_values, grid_coords, 
-                                 method=method, fill_value=np.nan)
-            
-            # Fill NaN values with nearest neighbor as fallback
-            if np.any(np.isnan(grid_obs_q)):
-                nan_mask = np.isnan(grid_obs_q)
-                grid_obs_q_nearest = griddata(station_xy, obs_q_values, grid_coords[nan_mask], 
-                                             method='nearest')
-                grid_sim_q_nearest = griddata(station_xy, sim_q_values, grid_coords[nan_mask], 
-                                             method='nearest')
-                grid_obs_q[nan_mask] = grid_obs_q_nearest
-                grid_sim_q[nan_mask] = grid_sim_q_nearest
+            if method == 'rbf':
+                # Use RBF interpolation to avoid TIN artifacts
+                rbf_obs = Rbf(station_xy[:, 0], station_xy[:, 1], obs_q_values, 
+                             function='multiquadric', smooth=0.1)
+                rbf_sim = Rbf(station_xy[:, 0], station_xy[:, 1], sim_q_values, 
+                             function='multiquadric', smooth=0.1)
+                
+                grid_obs_q = rbf_obs(grid_coords[:, 0], grid_coords[:, 1])
+                grid_sim_q = rbf_sim(grid_coords[:, 0], grid_coords[:, 1])
+                
+            else:
+                # Use nearest neighbor as fallback
+                grid_obs_q = griddata(station_xy, obs_q_values, grid_coords, 
+                                     method='nearest', fill_value=np.nan)
+                grid_sim_q = griddata(station_xy, sim_q_values, grid_coords, 
+                                     method='nearest', fill_value=np.nan)
                 
         except Exception as e:
             print(f"Warning: {method} interpolation failed for quantile {i}, using nearest neighbor. Error: {e}")
@@ -176,14 +183,17 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
     sim_means = np.array([station_corrections[station]['sim_mean'] for station in valid_stations])
     
     try:
-        grid_obs_means = griddata(station_xy, obs_means, grid_coords, method=method, fill_value=np.nan)
-        grid_sim_means = griddata(station_xy, sim_means, grid_coords, method=method, fill_value=np.nan)
-        
-        # Fill NaN values with nearest neighbor
-        if np.any(np.isnan(grid_obs_means)):
-            nan_mask = np.isnan(grid_obs_means)
-            grid_obs_means[nan_mask] = griddata(station_xy, obs_means, grid_coords[nan_mask], method='nearest')
-            grid_sim_means[nan_mask] = griddata(station_xy, sim_means, grid_coords[nan_mask], method='nearest')
+        if method == 'rbf':
+            rbf_obs_mean = Rbf(station_xy[:, 0], station_xy[:, 1], obs_means, 
+                              function='multiquadric', smooth=0.1)
+            rbf_sim_mean = Rbf(station_xy[:, 0], station_xy[:, 1], sim_means, 
+                              function='multiquadric', smooth=0.1)
+            
+            grid_obs_means = rbf_obs_mean(grid_coords[:, 0], grid_coords[:, 1])
+            grid_sim_means = rbf_sim_mean(grid_coords[:, 0], grid_coords[:, 1])
+        else:
+            grid_obs_means = griddata(station_xy, obs_means, grid_coords, method='nearest', fill_value=np.nan)
+            grid_sim_means = griddata(station_xy, sim_means, grid_coords, method='nearest', fill_value=np.nan)
             
     except Exception as e:
         print(f"Warning: {method} interpolation failed for means, using nearest neighbor. Error: {e}")
@@ -193,12 +203,11 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
     grid_correction_factors['obs_means'] = grid_obs_means
     grid_correction_factors['sim_means'] = grid_sim_means
     
-    # IMPROVEMENT 2: Apply spatial smoothing to reduce artifacts
+    # Apply spatial smoothing to further reduce artifacts
     if smooth_sigma > 0:
-        print(f"Applying spatial smoothing (sigma={smooth_sigma})...")
+        print(f"Applying spatial smoothing (sigma={smooth_sigma}) to reduce remaining artifacts...")
         
         # Need to determine grid shape for smoothing
-        # Estimate grid shape from coordinates
         unique_x = np.unique(grid_coords[:, 0])
         unique_y = np.unique(grid_coords[:, 1])
         grid_shape = (len(unique_y), len(unique_x))
@@ -232,7 +241,7 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
         else:
             print("⚠️  Irregular grid detected - skipping spatial smoothing")
     
-    # IMPROVEMENT 3: Final check for extreme correction factors
+    # Final check for extreme correction factors
     print("Final check for extreme correction factors...")
     for i in range(n_quantiles):
         obs_q = grid_correction_factors['obs_quantiles'][:, i]
@@ -258,9 +267,10 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
 
 def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, chunk_size=50000):
     """
-    Optimized version using vectorized operations and pre-computed nearest neighbors
+    Optimized version - ONLY corrects non-zero, non-NaN pixels
+    Preserves zeros and NaNs in original forecast
     """
-    print("Applying bias corrections to forecast (optimized)...")
+    print("Applying bias corrections to forecast (only non-zero, non-NaN pixels)...")
     
     # Get grid info
     grid_correction_factors = correction_data['grid_correction_factors']
@@ -292,7 +302,7 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
     forecast_x, forecast_y = np.meshgrid(x_vals, y_vals, indexing='xy')
     forecast_coords = np.column_stack([forecast_x.ravel(), forecast_y.ravel()])
     
-    from scipy.spatial import cKDTree  # Much faster than cdist
+    from scipy.spatial import cKDTree
     grid_tree = cKDTree(grid_coords)
     _, nearest_indices = grid_tree.query(forecast_coords, k=1)
     nearest_indices = nearest_indices.reshape(len(y_vals), len(x_vals))
@@ -307,22 +317,27 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
     # Create corrected dataset
     corrected_ds = forecast_ds.copy(deep=True)
     
-    # VECTORIZED CORRECTION FUNCTION
+    # VECTORIZED CORRECTION FUNCTION - ONLY FOR NON-ZERO, NON-NAN PIXELS
     def apply_correction_vectorized(forecast_2d):
-        """Apply corrections to entire 2D array at once"""
+        """Apply corrections ONLY to non-zero, non-NaN pixels"""
         flat_forecast = forecast_2d.ravel()
         flat_nearest = nearest_indices.ravel()
-        corrected_flat = np.zeros_like(flat_forecast)
+        corrected_flat = flat_forecast.copy()  # Start with original values
         
-        # Get valid (non-NaN) points
-        valid_mask = ~np.isnan(flat_forecast)
-        if not np.any(valid_mask):
+        # CRITICAL: Only correct non-zero, non-NaN pixels
+        correction_mask = ~np.isnan(flat_forecast) & (flat_forecast > 0)
+        
+        if not np.any(correction_mask):
+            print("  No non-zero, non-NaN pixels to correct")
             return forecast_2d
         
-        valid_forecast = flat_forecast[valid_mask]
-        valid_nearest = flat_nearest[valid_mask]
+        n_to_correct = np.sum(correction_mask)
+        print(f"  Correcting {n_to_correct} non-zero, non-NaN pixels out of {len(flat_forecast)} total")
         
-        # Get correction factors for all valid points at once
+        valid_forecast = flat_forecast[correction_mask]
+        valid_nearest = flat_nearest[correction_mask]
+        
+        # Get correction factors for pixels to be corrected
         obs_q_matrix = obs_quantiles[valid_nearest, :]  # Shape: (n_valid, n_quantiles)
         sim_q_matrix = sim_quantiles[valid_nearest, :]  # Shape: (n_valid, n_quantiles)
         
@@ -342,12 +357,12 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
             except:
                 corrected_valid[i] = valid_forecast[i]
         
-        # Ensure no negative values
+        # Ensure no negative values for corrected pixels
         corrected_valid = np.maximum(corrected_valid, 0.0)
         
-        # Put back into full array
-        corrected_flat[valid_mask] = corrected_valid
-        corrected_flat[~valid_mask] = flat_forecast[~valid_mask]  # Keep NaN values
+        # ONLY update the pixels that should be corrected
+        corrected_flat[correction_mask] = corrected_valid
+        # zeros and NaNs remain unchanged
         
         return corrected_flat.reshape(forecast_2d.shape)
     
@@ -361,7 +376,7 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
             # Get forecast values for this time step
             forecast_2d = forecast_data.isel(time=t_idx).values
             
-            # Apply vectorized correction
+            # Apply vectorized correction (only to non-zero, non-NaN)
             corrected_2d = apply_correction_vectorized(forecast_2d)
             
             # Update the corrected dataset
@@ -528,7 +543,7 @@ if len(common_dates) > 0 and len(common_stations) > 0:
         station_coords_dict, 
         correction_factors_stations, 
         grid_coords, 
-        method='linear',           # Changed from 'nearest' to 'linear'
+        method='rbf',             # Changed from 'linear' to 'rbf' to avoid TIN artifacts
         smooth_sigma=2.0,         # Added spatial smoothing
         max_change_factor=3.0     # Added outlier capping
     )
@@ -636,11 +651,7 @@ def main():
     corrected_ds.attrs['correction_stations_used'] = str(correction_data['n_stations'])  # Convert to string
 
     corrected_ds.to_netcdf(output_path,encoding={
-        '__xarray_dataarray_variable__': {'dtype': 'float32', 'zlib': True, 'complevel': 5},
-        'y': {'dtype': 'float32', 'zlib': True, 'complevel': 5},
-        'x': {'dtype': 'float32', 'zlib': True, 'complevel': 5},
-        'time': {'dtype': 'float64', 'zlib': True, 'complevel': 5},
-        'spatial_ref': {'dtype': 'int32', 'zlib': True, 'complevel': 5},
+        '__xarray_dataarray_variable__': {'dtype': 'float32', 'zlib': True, 'complevel': 5}
     })
     
     print("✅ BIAS CORRECTION COMPLETE!")
