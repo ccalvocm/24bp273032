@@ -4,11 +4,11 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from shapely.geometry import Point
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from scipy.spatial import cKDTree
 from numba import jit, prange
 import time
 import warnings
+from rasterio.features import rasterize
+from rasterio.transform import from_bounds
 warnings.filterwarnings('ignore')
 
 # === ROBUST NETWORK-BASED GWR FUNCTIONS ===
@@ -245,29 +245,6 @@ def nash_sutcliffe_jit(obs, sim):
     den = np.sum((obs - obs_mean) ** 2)
     return 1.0 - num/den if den != 0 else np.nan
 
-# === PARAMETERS ===
-glofas_nc = "../Rst/GloFAS_2025_06_13_f.nc"
-var_name = "dis24"
-time_idx = 0
-ELEV_RASTER= "../Rst/dem90fill.tif"
-stream_file = "../geodata/riverQ.gpkg"
-target_crs = "EPSG:32719"
-p = 2  # IDW power parameter
-elev_scale = 0.1  # Scale factor for elevation to match horizontal distance units
-max_dist = 15000  # Max distance in meters for considering neighbors
-
-# GWR-specific parameters
-gwr_bandwidth = 15000.0  # Increased bandwidth
-min_neighbors = 6        # Reduced minimum neighbors
-
-# === 1. Load GloFAS discharge and convert to grid polygons ===
-ds = xr.open_dataset(glofas_nc)
-dis = ds[var_name][time_idx, :, :].isel(forecast_period=0)
-lat_name = [dim for dim in dis.dims if 'lat' in dim][0]
-lon_name = [dim for dim in dis.dims if 'lon' in dim][0]
-lats = dis[lat_name].values
-lons = dis[lon_name].values
-
 # Build GloFAS points
 
 def build_glofas_gdf(dis, lats, lons, target_crs):
@@ -294,176 +271,187 @@ def build_glofas_gdf(dis, lats, lons, target_crs):
     ).to_crs(target_crs)
     return glofas_gdf
 
-# Usage:
-# glofas_gdf = build_glofas_gdf(dis, lats, lons, target_crs)
-glofas_gdf = build_glofas_gdf(dis, lats, lons, target_crs)
-# === 2. Extract elevation at GloFAS points ===
 
-# Extract elevations
-glofas_coords = np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y])
-with rasterio.open(ELEV_RASTER) as src:
-    glofas_gdf["elevation"] = [val[0] for val in src.sample(glofas_coords)]
+def gdf2raster(gdf,
+                col=None,
+                res=500, fill=np.nan,
+                dis_utm=None):
+    """    Convert a GeoDataFrame to a raster using a specified column for values.
+    Args:
+        gdf (GeoDataFrame): Input GeoDataFrame with geometries and values.
+        col (str): Column name in GeoDataFrame to use for raster values.
+        res (int): Resolution of the output raster in pixels.
+        fill (float): Value to fill empty pixels in the raster.
+    Returns:
+        xr.DataArray: Rasterized data as an xarray DataArray.
+    """
+    # Ensure the GeoDataFrame has the specified column
+    # Ultra-fast optimized
+    res, col = 500, col
+    x_min, x_max, y_min, y_max = dis_utm.x.min(), dis_utm.x.max(), dis_utm.y.min(), dis_utm.y.max()
+    width, height = int(np.ceil((x_max - x_min) / res)), int(np.ceil((y_max - y_min) / res))
 
-print(f"Loaded {len(glofas_gdf)} GloFAS observation points")
-print(f"GloFAS Q range: {glofas_gdf['Q'].min():.3f} - {glofas_gdf['Q'].max():.3f}")
-print(f"GloFAS Q mean: {glofas_gdf['Q'].mean():.3f}")
+    # Fixed rasterize call
+    valid = gdf.dropna(subset=[col])
+    raster = rasterize(
+        shapes=[(g, v) for g, v in zip(valid.geometry, valid[col])], 
+        out_shape=(height, width), 
+        transform=from_bounds(x_min, y_min, x_max, y_max, width, height),
+        fill=0, 
+        all_touched=True, 
+        dtype='float32'
+    )
 
-# === 2. Load stream network ===
-streams = gpd.read_file(stream_file).to_crs(target_crs)
-if "segment_id" not in streams.columns:
-    streams["segment_id"] = streams.index.astype(str)
+    # Save
+    da=xr.DataArray(raster, coords={'y': np.linspace(y_max, y_min, height), 
+                                'x': np.linspace(x_min, x_max, width)}, 
+                dims=['y', 'x']).rio.write_crs(gdf.crs)
 
-centroids = streams.geometry.centroid
-stream_coords = np.column_stack([centroids.x, centroids.y])
+    print(f"✅ {np.sum(~np.isnan(raster))} pixels")
+    return da
 
-with rasterio.open(ELEV_RASTER) as src:
-    stream_elev = np.array([val[0] for val in src.sample(stream_coords)])
+# === PARAMETERS ===
+glofas_nc='../Rst/dis_1980_2018_clip.nc'
+var_name = "dis"
+time_idx = 0
+ELEV_RASTER= "../Rst/dem90fill.tif"
+stream_file = "../geodata/riverQ.gpkg"
+target_crs = "EPSG:32719"
+p = 2  # IDW power parameter
+elev_scale = 0.1  # Scale factor for elevation to match horizontal distance units
+max_dist = 15000  # Max distance in meters for considering neighbors
 
-print(f"Loaded {len(streams)} stream segments")
+# GWR-specific parameters
+gwr_bandwidth = 15000.0  # Increased bandwidth
+min_neighbors = 6        # Reduced minimum neighbors
 
-# === 3. Data preparation ===
-# Remove any zero or negative discharge values that might cause issues
-valid_q_mask = glofas_gdf['Q'] > 0.001  # Minimum threshold
-if np.sum(~valid_q_mask) > 0:
-    print(f"Removing {np.sum(~valid_q_mask)} GloFAS points with Q <= 0.001")
-    glofas_gdf = glofas_gdf[valid_q_mask].copy()
+# === 1. Load GloFAS discharge and convert to grid polygons ===
+ds = xr.open_dataset(glofas_nc)
+
+times = ds['time'].values
+ras_list = []
+
+for time in times:
+    dis = ds[var_name].sel(time=time)
+    lat_name = [dim for dim in dis.dims if 'lat' in dim][0]
+    lon_name = [dim for dim in dis.dims if 'lon' in dim][0]
+    lats = dis[lat_name].values
+    lons = dis[lon_name].values
+
+    # Usage:
+    # glofas_gdf = build_glofas_gdf(dis, lats, lons, target_crs)
+    glofas_gdf = build_glofas_gdf(dis, lats, lons, target_crs)
+    # === 2. Extract elevation at GloFAS points ===
+
+    # Extract elevations
     glofas_coords = np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y])
+    with rasterio.open(ELEV_RASTER) as src:
+        glofas_gdf["elevation"] = [val[0] for val in src.sample(glofas_coords)]
 
-# Subsample if needed
-max_obs_points = 600
-if len(glofas_gdf) > max_obs_points:
-    print(f"Subsampling GloFAS points: {len(glofas_gdf)} → {max_obs_points}")
-    # Stratified sampling to maintain spatial distribution
-    sample_indices = np.random.choice(len(glofas_gdf), max_obs_points, replace=False)
-    obs_coords = glofas_coords[sample_indices]
-    obs_elevations = glofas_gdf['elevation'].values[sample_indices]
-    obs_q_values = glofas_gdf['Q'].values[sample_indices]
-else:
-    obs_coords = glofas_coords
-    obs_elevations = glofas_gdf['elevation'].values
-    obs_q_values = glofas_gdf['Q'].values
+    print(f"Loaded {len(glofas_gdf)} GloFAS observation points")
+    print(f"GloFAS Q range: {glofas_gdf['Q'].min():.3f} - {glofas_gdf['Q'].max():.3f}")
+    print(f"GloFAS Q mean: {glofas_gdf['Q'].mean():.3f}")
 
-print(f"Using {len(obs_q_values)} observation points")
-print(f"Obs Q range: {np.min(obs_q_values):.3f} - {np.max(obs_q_values):.3f}")
+    # === 2. Load stream network ===
+    streams = gpd.read_file(stream_file).to_crs(target_crs)
+    if "segment_id" not in streams.columns:
+        streams["segment_id"] = streams.index.astype(str)
 
-# === 4. Try both methods ===
-print("Trying Robust Network GWR...")
-gwr_start = time.time()
+    centroids = streams.geometry.centroid
+    stream_coords = np.column_stack([centroids.x, centroids.y])
 
-gwr_predictions = robust_network_gwr_predict(
-    stream_coords,
-    stream_elev,
-    obs_coords,
-    obs_elevations,
-    obs_q_values,
-    bandwidth=gwr_bandwidth,
-    min_neighbors=min_neighbors
-)
+    with rasterio.open(ELEV_RASTER) as src:
+        stream_elev = np.array([val[0] for val in src.sample(stream_coords)])
 
-print(f"GWR completed in {time.time() - gwr_start:.2f}s")
+    print(f"Loaded {len(streams)} stream segments")
 
-# Check for zeros and apply backup method if needed
-zero_count = np.sum(gwr_predictions <= 0)
-if zero_count > len(gwr_predictions) * 0.1:  # If >10% are zero/negative
-    print(f"⚠️ GWR produced {zero_count} zeros/negatives ({zero_count/len(gwr_predictions)*100:.1f}%)")
-    print("Applying backup Network IDW...")
-    
-    idw_start = time.time()
-    idw_predictions = simple_network_idw(
+    # === 3. Data preparation ===
+    # Remove any zero or negative discharge values that might cause issues
+    valid_q_mask = glofas_gdf['Q'] > 0.001  # Minimum threshold
+    if np.sum(~valid_q_mask) > 0:
+        print(f"Removing {np.sum(~valid_q_mask)} GloFAS points with Q <= 0.001")
+        glofas_gdf = glofas_gdf[valid_q_mask].copy()
+        glofas_coords = np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y])
+
+    # Subsample if needed
+    max_obs_points = 600
+    if len(glofas_gdf) > max_obs_points:
+        print(f"Subsampling GloFAS points: {len(glofas_gdf)} → {max_obs_points}")
+        # Stratified sampling to maintain spatial distribution
+        sample_indices = np.random.choice(len(glofas_gdf), max_obs_points, replace=False)
+        obs_coords = glofas_coords[sample_indices]
+        obs_elevations = glofas_gdf['elevation'].values[sample_indices]
+        obs_q_values = glofas_gdf['Q'].values[sample_indices]
+    else:
+        obs_coords = glofas_coords
+        obs_elevations = glofas_gdf['elevation'].values
+        obs_q_values = glofas_gdf['Q'].values
+
+    print(f"Using {len(obs_q_values)} observation points")
+    print(f"Obs Q range: {np.min(obs_q_values):.3f} - {np.max(obs_q_values):.3f}")
+
+    # === 4. Try both methods ===
+    print("Trying Robust Network GWR...")
+
+    gwr_predictions = robust_network_gwr_predict(
         stream_coords,
         stream_elev,
         obs_coords,
         obs_elevations,
         obs_q_values,
-        max_dist=max_dist,
-        p=2.0
+        bandwidth=gwr_bandwidth,
+        min_neighbors=min_neighbors
     )
-    print(f"Backup IDW completed in {time.time() - idw_start:.2f}s")
-    
-    # Use IDW for zero/negative predictions
-    final_predictions = np.where(gwr_predictions <= 0, idw_predictions, gwr_predictions)
-    method_used = "GWR + IDW backup"
-else:
-    final_predictions = gwr_predictions
-    method_used = "Pure GWR"
 
-print(f"Method used: {method_used}")
-print(f"Final zero count: {np.sum(final_predictions <= 0)}")
+    # Check for zeros and apply backup method if needed
+    zero_count = np.sum(gwr_predictions <= 0)
+    if zero_count > len(gwr_predictions) * 0.1:  # If >10% are zero/negative
+        print(f"⚠️ GWR produced {zero_count} zeros/negatives ({zero_count/len(gwr_predictions)*100:.1f}%)")
+        print("Applying backup Network IDW...")
+        
+        idw_start = time.time()
+        idw_predictions = simple_network_idw(
+            stream_coords,
+            stream_elev,
+            obs_coords,
+            obs_elevations,
+            obs_q_values,
+            max_dist=max_dist,
+            p=2.0
+        )
+        print(f"Backup IDW completed in {time.time() - idw_start:.2f}s")
+        
+        # Use IDW for zero/negative predictions
+        final_predictions = np.where(gwr_predictions <= 0, idw_predictions, gwr_predictions)
+        method_used = "GWR + IDW backup"
+    else:
+        final_predictions = gwr_predictions
+        method_used = "Pure GWR"
 
-# === 5. Assign results ===
-streams["Q_network_gwr"] = final_predictions
+    print(f"Method used: {method_used}")
+    print(f"Final zero count: {np.sum(final_predictions <= 0)}")
 
-# Clean and save
-streams_clean = streams.copy()
-if 'centroid' in streams_clean.columns:
-    streams_clean = streams_clean.drop(columns=['centroid'])
+    # === 5. Assign results ===
+    streams["Q_network_gwr"] = final_predictions
 
-streams_clean["Q_network_gwr"] = pd.to_numeric(streams_clean["Q_network_gwr"], errors='coerce')
-streams_clean.to_file("streams_robust_network_gwr.gpkg", driver="GPKG")
+    # Clean and save
+    streams_clean = streams.copy()
+    if 'centroid' in streams_clean.columns:
+        streams_clean = streams_clean.drop(columns=['centroid'])
 
-# === 6. Evaluation ===
-def evaluate_results():
-    s = streams.copy()
-    centroids = s.geometry.centroid
-    s = s.set_geometry(centroids)
-    s["Q_network_gwr"] = s["Q_network_gwr"].fillna(0)
-    
-    g = glofas_gdf.copy()
-    g = g.set_crs(s.crs, allow_override=True)
-    
-    joined = gpd.sjoin_nearest(
-        s[["Q_network_gwr", s.geometry.name]],
-        g[["Q", g.geometry.name]],
-        how="inner",
-        distance_col="dist",
-        max_distance=max_dist
-    )
-    
-    if joined.empty:
-        return {"n_points": 0, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "NSE": np.nan}
-    
-    y_pred = joined["Q_network_gwr"].to_numpy()
-    y_obs = joined["Q"].to_numpy()
-    mask = np.isfinite(y_pred) & np.isfinite(y_obs) & (y_pred > 0) & (y_obs > 0)
-    y_pred, y_obs = y_pred[mask], y_obs[mask]
-    
-    if len(y_obs) == 0:
-        return {"n_points": 0, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "NSE": np.nan}
-    
-    mae = mean_absolute_error(y_obs, y_pred)
-    rmse = mean_squared_error(y_obs, y_pred, squared=False)
-    r2 = r2_score(y_obs, y_pred)
-    nse = nash_sutcliffe_jit(y_obs, y_pred)
-    
-    return {"n_points": len(y_obs), "MAE": mae, "RMSE": rmse, "R2": r2, "NSE": nse}
+    streams_clean["Q_network_gwr"] = pd.to_numeric(streams_clean["Q_network_gwr"], errors='coerce')
+    # streams_clean.to_file("streams_robust_network_gwr.gpkg", driver="GPKG")
 
-metrics = evaluate_results()
-end_time = time.time()
+    ras = gdf2raster(streams_clean,
+                col="Q_network_gwr",
+                res=500, fill=np.nan,
+                dis_utm=dis.rio.write_crs('EPSG:4326').rio.reproject(target_crs))
 
-# === 7. Results ===
-print("\n" + "="*60)
-print("🌊 ROBUST NETWORK GWR RESULTS")
-print("="*60)
+    ras_list.append(ras)
 
-print(f"Method: {method_used}")
-
-print("\n=== BENCHMARK RESULTS ===")
-print("Robust Network GWR:", metrics)
-
-print("\n=== DISCHARGE STATISTICS ===")
-q_pred = streams_clean["Q_network_gwr"].dropna()
-print(f"Predicted discharge statistics:")
-print(f"  Count: {len(q_pred)}")
-print(f"  Non-zero: {np.sum(q_pred > 0)} ({np.sum(q_pred > 0)/len(q_pred)*100:.1f}%)")
-print(f"  Min: {q_pred.min():.4f}")
-print(f"  Max: {q_pred.max():.4f}")
-print(f"  Mean: {q_pred.mean():.4f}")
-print(f"  Median: {np.median(q_pred):.4f}")
-print(f"  Std Dev: {q_pred.std():.4f}")
-
-print(f"\n=== PARAMETERS ===")
-print(f"Bandwidth: {gwr_bandwidth}m")
-print(f"Min neighbors: {min_neighbors}")
-print(f"Observation points: {len(obs_q_values)}")
-
-print("\n🌊 Robust Network GWR Complete!")
+# === 9. Save results ===
+ras_combined = xr.concat(ras_list, dim='time')
+ras_combined = ras_combined.assign_coords(
+    time=pd.to_datetime(times)).rename({'time': 'time'})
+ras_combined.rio.write_crs(target_crs, inplace=True)
+ras_combined.to_netcdf("dis_3d_idw_GWR_1980_2018.nc")

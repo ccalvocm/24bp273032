@@ -10,7 +10,7 @@ from scipy.stats import rankdata
 from scipy.interpolate import interp1d
 
 # Compute NSE between ds_nat and df_pivot
-def nash_sutcliffe_efficiency(observed, simulated, min_n=12000):
+def nash_sutcliffe_efficiency(observed, simulated, min_n=6000):
     """Calculate Nash-Sutcliffe Efficiency only if sufficient data points"""
     # Remove NaN values
     mask = ~(np.isnan(observed) | np.isnan(simulated))
@@ -256,75 +256,6 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
     print("✅ Grid interpolation complete with artifact reduction!")
     return grid_correction_factors
 
-def apply_quantile_delta_mapping(forecast_values, correction_factors):
-    """
-    Apply quantile delta mapping correction to forecast values
-    
-    Parameters:
-    -----------
-    forecast_values : array-like or scalar
-        Raw forecast values to be corrected
-    correction_factors : dict
-        Trained correction factors from historical period
-        
-    Returns:
-    --------
-    array or scalar : Bias-corrected forecast values
-    """
-    # Convert to numpy array if needed
-    forecast_values = np.asarray(forecast_values)
-    
-    # Handle scalar case
-    if forecast_values.ndim == 0:
-        forecast_values = forecast_values.reshape(1)
-        return_scalar = True
-    else:
-        return_scalar = False
-    
-    # Remove NaN values for processing
-    mask = ~np.isnan(forecast_values)
-    if not np.any(mask):
-        return forecast_values if not return_scalar else forecast_values[0]
-    
-    clean_forecast = forecast_values[mask]
-    corrected_clean = np.zeros_like(clean_forecast)
-    
-    # Get correction mapping
-    quantile_levels = correction_factors['quantile_levels']
-    obs_quantiles = correction_factors['obs_quantiles'] 
-    sim_quantiles = correction_factors['sim_quantiles']
-    
-    # Handle edge cases
-    if len(clean_forecast) == 0:
-        return forecast_values if not return_scalar else forecast_values[0]
-    
-    # Create interpolation functions
-    try:
-        from scipy.interpolate import interp1d
-        
-        # Map simulated quantiles to observed quantiles
-        sim_to_obs_interp = interp1d(
-            sim_quantiles, obs_quantiles, 
-            kind='linear', bounds_error=False, 
-            fill_value=(obs_quantiles[0], obs_quantiles[-1])
-        )
-        
-        # Apply correction
-        corrected_clean = sim_to_obs_interp(clean_forecast)
-        
-        # Ensure no negative values for streamflow
-        corrected_clean = np.maximum(corrected_clean, 0.0)
-        
-    except Exception as e:
-        print(f"Warning: Correction failed, returning original values. Error: {e}")
-        corrected_clean = clean_forecast
-    
-    # Put corrected values back
-    corrected_forecast = forecast_values.copy()
-    corrected_forecast[mask] = corrected_clean
-    
-    return corrected_forecast[0] if return_scalar else corrected_forecast
-
 def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, chunk_size=50000):
     """
     Optimized version using vectorized operations and pre-computed nearest neighbors
@@ -458,7 +389,7 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
 
 print("=== CREATING HISTORICAL CORRECTION FACTORS ===")
 
-file='/Users/carlos/Downloads/caudal_diario_historico_4.txt'
+file=os.path.join('..','output','caudal_diario_historico_4.txt')
 df=pd.read_csv(file, sep=',', encoding='latin1')
 
 # metadata
@@ -488,7 +419,7 @@ df_pivot.to_csv(os.path.join('..',
 print("✅ Observed data processed and saved")
 
 # Load historical model data (1980-2018)
-path_nc='/Users/carlos/Downloads/dis_3d_idw_optimized_1980_2018.nc'
+path_nc='dis_3d_idw_optimized_1980_2018.nc'
 ds=xr.open_dataset(path_nc, chunks={'time': 1, 'lat': 500, 'lon': 500})
 ds.rio.write_crs("EPSG:32719", inplace=True)
 
@@ -655,14 +586,13 @@ else:
 
 print("\n=== HISTORICAL CORRECTION FACTORS CREATION COMPLETE ===")
 
-
 def main():
     """Main function to apply corrections to GloFAS forecast"""
     
     print("=== APPLYING BIAS CORRECTION TO GLOFAS FORECAST ===")
     
     # File paths
-    forecast_path = '/Users/carlos/Documents/GitHub/24bp273032/Rst/GloFAS_2019_01_01_f.nc'
+    forecast_path = os.path.join('..','Rst','GloFAS_2019_01_01_f.nc')
     correction_factors_path = '../output/historical_correction_factors.pkl'
     
     # Load forecast data
@@ -705,7 +635,13 @@ def main():
     corrected_ds.attrs['correction_creation_date'] = str(correction_data['creation_date'])
     corrected_ds.attrs['correction_stations_used'] = str(correction_data['n_stations'])  # Convert to string
 
-    corrected_ds.to_netcdf(output_path, encoding=encoding)
+    corrected_ds.to_netcdf(output_path,encoding={
+        '__xarray_dataarray_variable__': {'dtype': 'float32', 'zlib': True, 'complevel': 5},
+        'y': {'dtype': 'float32', 'zlib': True, 'complevel': 5},
+        'x': {'dtype': 'float32', 'zlib': True, 'complevel': 5},
+        'time': {'dtype': 'float64', 'zlib': True, 'complevel': 5},
+        'spatial_ref': {'dtype': 'int32', 'zlib': True, 'complevel': 5},
+    })
     
     print("✅ BIAS CORRECTION COMPLETE!")
     print(f"   📁 Original forecast: {forecast_path}")
