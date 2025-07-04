@@ -1,0 +1,14 @@
+<PAMDataset>
+  <Subdataset name="__xarray_dataarray_variable__">
+    <PAMDataset>
+      <PAMRasterBand band="1">
+        <Metadata>
+          <MDI key="STATISTICS_MAXIMUM">270.57809448242</MDI>
+          <MDI key="STATISTICS_MEAN">1.3253274039895</MDI>
+          <MDI key="STATISTICS_MINIMUM">0</MDI>
+          <MDI key="STATISTICS_STDDEV">10.261636058049</MDI>
+        </Metadata>
+      </PAMRasterBand>
+    </PAMDataset>
+  </Subdataset>
+</PAMDataset>
