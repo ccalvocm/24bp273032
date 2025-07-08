@@ -284,7 +284,13 @@ def apply_bmorph_correction_to_2d_ultra_fast(forecast_2d, nearest_indices, sim_q
     
     # Ensure no negative values
     corrected_valid = np.maximum(corrected_valid, 0.0)
-    
+
+    # Clamp any extreme jumps: no more than 3× the original
+    max_factor = 3.0
+    orig = valid_forecast
+    too_big = corrected_valid / (orig + 1e-6) > max_factor
+    corrected_valid[too_big] = orig[too_big] * max_factor
+
     # Update only corrected pixels
     corrected_flat[valid_mask] = corrected_valid
     
