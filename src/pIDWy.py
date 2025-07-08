@@ -9,6 +9,12 @@ import xarray as xr
 import numpy as np
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
+from EDCDFM_DGA import apply_bmorph_corrections_fast
+import gc
+import scipy.stats
+import shapely.geometry as sg
+from scipy.spatial import cKDTree
+
 _RASTER_CACHE = {
 'bounds': None,      # (x0, x1, y0, y1, width, height)
 'transform': None,   # affine.Transform
@@ -310,40 +316,37 @@ def interp_glofas(glofas_nc="nc_test.nc"):
         name='dis24'
     ).rio.write_crs(target_crs)
 
-    # Reproject all slices
-    for i in range(len(ds_clipped['forecast_period'])):
-        for j in range(len(ds_clipped['forecast_reference_time'])):
-            for k in range(len(ds_clipped['number'])):
-                slice_2d = ds_clipped['dis24'].isel(forecast_period=i, forecast_reference_time=j, number=k)
-                reprojected_2d = slice_2d.rio.reproject_match(template_2d)
-                ds_utm[i, j, k, :, :] = reprojected_2d.values
-
-    print("✅ Reprojection with all ensemble members complete!")
-
     # load streams and retrieve coordinates
     streams, stream_coords = load_stream_data(stream_file, target_crs)
 
     # sample stream elevations at stream coordinates
     stream_elev = extract_stream_elevations(stream_coords,ELEV_RASTER)
 
+    # Reproject all slices AND process interpolation in single loop
+    j = 0  # Always use first forecast_reference_time
     ras_list = []
-
-    for i, time_ in enumerate(ds_utm['forecast_period']):
+    
+    for i, time_ in enumerate(ds_clipped['forecast_period']):
         ras_time_list = []
-        for j, ensemble in enumerate(ds_utm['number']):
-            print(f"Processing time {i+1}/{len(ds_utm['forecast_period'])}, ensemble {j+1}/{len(ds_utm['number'])}...")
-
-            dis_utm = ds_utm.sel(forecast_period=time_, number=ensemble)
-
-            # === 5. Create 3D coordinates for BallTree ===
-            # Scale elevation to match horizontal distance units
+        for k, ensemble in enumerate(ds_clipped['number']):
+            print(f"Processing time {i+1}/{len(ds_clipped['forecast_period'])}, ensemble {k+1}/{len(ds_clipped['number'])}...")
+            
+            # === REPROJECTION ===
+            slice_2d = ds_clipped['dis24'].isel(forecast_period=i, forecast_reference_time=j, number=k)
+            dis_utm = slice_2d.rio.reproject_match(template_2d)
+            
+            # === INTERPOLATION ===
+            # Build GloFAS points and extract elevations
             glofas_gdf = build_glofas_gdf(dis_utm, lats, lons, target_crs)
             glofas_gdf = extract_elevations(glofas_gdf, ELEV_RASTER)
             
+            # Create 3D coordinates
             glofas_coords_3d, stream_coords_3d = prepare_3d_coordinates(glofas_gdf, stream_coords, stream_elev)
 
+            # Compute IDW interpolation
             idw_values_3d = compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf, stream_elev, stream_coords)
 
+            # Assign results to streams
             streams_clean = assign_results(streams, col, idw_values_3d)
 
             # Create raster
@@ -352,8 +355,14 @@ def interp_glofas(glofas_nc="nc_test.nc"):
         
         # Combine ensemble members for this time step
         ras_time_combined = xr.concat(ras_time_list, dim='number')
-        ras_time_combined = ras_time_combined.assign_coords(number=ds_utm['number'].values)
+        ras_time_combined = ras_time_combined.assign_coords(number=ds_clipped['number'].values)
         ras_list.append(ras_time_combined)
+
+    # === 9. Combine all time steps ===
+    ras_combined = xr.concat(ras_list, dim='forecast_period')
+    ras_combined = ras_combined.assign_coords(forecast_period=ds_clipped['forecast_period'].values)
+
+    print("✅ Combined reprojection and interpolation complete!")
 
     # === 9. Combine all time steps ===
     ras_combined = xr.concat(ras_list, dim='forecast_period')
@@ -361,6 +370,11 @@ def interp_glofas(glofas_nc="nc_test.nc"):
 
     # Set proper CRS and save
     ras_combined.rio.write_crs(target_crs, inplace=True)
+
+    ras_combined.sel(
+        forecast_period=ds_clipped['forecast_period'][-1], 
+        number=ds_clipped['number'][-1]
+    ).plot()
 
     return ras_combined
 

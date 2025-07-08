@@ -535,6 +535,11 @@ def main(forecast_path=None):
         },
         'grid_coords': npz['grid_coords'],
     }
+    
+    # Clear npz from memory immediately
+    del npz
+    import gc
+    gc.collect()
 
     # Ensure forecast has CRS information
     if not hasattr(forecast_ds, 'rio') or forecast_ds.rio.crs is None:
@@ -558,6 +563,10 @@ def main(forecast_path=None):
     # Create forecast coordinate grid ONCE
     forecast_x, forecast_y = np.meshgrid(x_vals, y_vals, indexing='xy')
     forecast_coords = np.column_stack([forecast_x.ravel(), forecast_y.ravel()])
+
+    # Clear temporary coordinate arrays
+    del forecast_x, forecast_y
+    gc.collect()
     
     # Build KDTree and query ONCE
     print("Building KDTree and finding nearest neighbors...")
@@ -565,6 +574,10 @@ def main(forecast_path=None):
     _, nearest_indices = grid_tree.query(forecast_coords, k=1)
     nearest_indices = nearest_indices.reshape(len(y_vals), len(x_vals))
     
+    # Clear temporary variables
+    del forecast_coords, grid_tree
+    gc.collect()
+
     # Add pre-computed indices to correction_data
     correction_data['nearest_indices'] = nearest_indices
     correction_data['forecast_shape'] = (len(y_vals), len(x_vals))
@@ -573,9 +586,7 @@ def main(forecast_path=None):
     
     # =========================================================================
     # APPLY CORRECTIONS USING PRE-COMPUTED NEAREST NEIGHBORS
-    # =========================================================================
-    forecast_ds_uncorrected = forecast_ds.copy(deep=True)
-    
+    # =========================================================================    
     # Apply corrections
     print("\nApplying bias corrections...")
     total_slices = len(forecast_ds['forecast_period']) * len(forecast_ds['number'])
@@ -590,20 +601,18 @@ def main(forecast_path=None):
             ds_uncorrected = forecast_ds.sel(forecast_period=time, number=number)
             corrected_ds = apply_bmorph_corrections_fast(ds_uncorrected, correction_data)
             forecast_ds.loc[dict(forecast_period=time, number=number)] = corrected_ds
+
+                        # Clear temporary variables from this iteration
+            del ds_uncorrected, corrected_ds
+            
+            # Force garbage collection every 20 slices to free memory
+            if processed % 20 == 0:
+                gc.collect()
     
+    del correction_data, forecast_ds_uncorrected
+    gc.collect()
     print("✅ BIAS CORRECTION COMPLETE!")
 
-    # Calculate some summary statistics
-    print("\n=== CORRECTION SUMMARY ===")
-    var_name = list(forecast_ds.data_vars)[0]
-    
-    original_mean = float(forecast_ds_uncorrected[var_name].mean())
-    corrected_mean = float(forecast_ds[var_name].mean())
-    
-    print(f"Original mean discharge: {original_mean:.2f}")
-    print(f"Corrected mean discharge: {corrected_mean:.2f}")
-    print(f"Mean change: {((corrected_mean/original_mean - 1) * 100):.1f}%")
-    
     return corrected_ds
 
 if __name__ == "__main__":
