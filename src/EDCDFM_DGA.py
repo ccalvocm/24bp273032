@@ -209,110 +209,86 @@ def interpolate_bmorph_factors_to_grid(station_coords, station_corrections, grid
         'sim_means': grid_sim_mean,
         'n_quantiles': n_quantiles
     }
-
-def apply_bmorph_corrections_to_forecast(forecast_ds, correction_data):
-    """
-    Apply B-Morph corrections to forecast using edcdfm-based grid correction factors
-    OPTIMIZED VERSION
-    """
-    print("Applying B-Morph bias corrections to forecast...")
     
-    # Get grid info
+# OPTIMIZED B-MORPH CORRECTION FUNCTION
+def apply_bmorph_corrections_fast(forecast_ds, correction_data):
+    
+    # Get pre-computed nearest neighbors (NO KDTree building!)
+    nearest_indices = correction_data['nearest_indices']
+    
+    # Get correction factors
     grid_correction_factors = correction_data['grid_correction_factors']
-    grid_coords = correction_data['grid_coords']
+    sim_quantiles_grid = grid_correction_factors['sim_quantiles']
+    obs_quantiles_grid = grid_correction_factors['obs_quantiles']
     
-    # Handle both Dataset and DataArray cases
+    # Handle dataset
     var_names = list(forecast_ds.data_vars)
     discharge_var = var_names[0]
     forecast_data = forecast_ds[discharge_var]
     
-    # Get forecast coordinates
-    y_vals = forecast_data.y.values
-    x_vals = forecast_data.x.values
-    
-    print(f"Forecast grid: {len(y_vals)} x {len(x_vals)} = {len(y_vals)*len(x_vals)} points")
-    
-    # PRE-COMPUTE NEAREST NEIGHBORS (OPTIMIZED)
-    print("Pre-computing nearest neighbors...")
-    forecast_x, forecast_y = np.meshgrid(x_vals, y_vals, indexing='xy')
-    forecast_coords = np.column_stack([forecast_x.ravel(), forecast_y.ravel()])
-    
-    grid_tree = cKDTree(grid_coords)
-    _, nearest_indices = grid_tree.query(forecast_coords, k=1)
-    nearest_indices = nearest_indices.reshape(len(y_vals), len(x_vals))
-    
-    # PRE-EXTRACT B-MORPH CORRECTION FACTORS
-    sim_quantiles_grid = grid_correction_factors['sim_quantiles']  # shape: (n_grid_points, n_quantiles)
-    obs_quantiles_grid = grid_correction_factors['obs_quantiles']  # shape: (n_grid_points, n_quantiles)
-    
-    # Create corrected dataset
+    # Create corrected copy
     corrected_ds = forecast_ds.copy(deep=True)
     
-    # OPTIMIZED B-MORPH CORRECTION FUNCTION
-    def apply_bmorph_vectorized_fast(forecast_2d):
-        """OPTIMIZED: Apply B-Morph corrections using fully vectorized operations"""
-        
-        # Flatten arrays for vectorized processing
-        flat_forecast = forecast_2d.ravel()
-        flat_nearest = nearest_indices.ravel()
-        
-        # Create mask for valid pixels (non-NaN, positive values)
-        valid_mask = ~np.isnan(flat_forecast) & (flat_forecast > 0)
-        
-        if not np.any(valid_mask):
-            return forecast_2d
-        
-        # Extract valid data
-        valid_forecast = flat_forecast[valid_mask]
-        valid_nearest = flat_nearest[valid_mask]
-        n_valid = len(valid_forecast)
-        
-        # Get quantile matrices for all valid pixels at once
-        sim_quantiles = sim_quantiles_grid[valid_nearest, :]  # shape: (n_valid, n_quantiles)
-        obs_quantiles = obs_quantiles_grid[valid_nearest, :]  # shape: (n_valid, n_quantiles)
-        
-        # VECTORIZED QUANTILE MAPPING
-        # For each valid pixel, find the quantile bin and interpolate
-        corrected_values = np.zeros(n_valid, dtype=np.float32)
-        
-        # Process in chunks to avoid memory issues
-        chunk_size = 10000
-        for i in range(0, n_valid, chunk_size):
-            end_idx = min(i + chunk_size, n_valid)
-            chunk_forecast = valid_forecast[i:end_idx]
-            chunk_sim_q = sim_quantiles[i:end_idx, :]
-            chunk_obs_q = obs_quantiles[i:end_idx, :]
-            
-            # Vectorized interpolation for the chunk
-            for j in range(len(chunk_forecast)):
-                try:
-                    corrected_values[i + j] = np.interp(
-                        chunk_forecast[j],
-                        chunk_sim_q[j, :],
-                        chunk_obs_q[j, :],
-                        left=chunk_obs_q[j, 0],
-                        right=chunk_obs_q[j, -1]
-                    )
-                except:
-                    corrected_values[i + j] = chunk_forecast[j]
-        
-        # Ensure no negative values
-        corrected_values = np.maximum(corrected_values, 0.0)
-        
-        # Create output array
-        corrected_flat = flat_forecast.copy()
-        corrected_flat[valid_mask] = corrected_values
-        
-        return corrected_flat.reshape(forecast_2d.shape)
-    
-    # Process single time slice
-    print("Processing single time slice")
+    # Apply correction to the 2D slice (FAST!)
     forecast_2d = forecast_data.values
-    corrected_2d = apply_bmorph_vectorized_fast(forecast_2d)
+    corrected_2d = apply_bmorph_correction_to_2d_ultra_fast(
+        forecast_2d, nearest_indices, sim_quantiles_grid, obs_quantiles_grid
+    )
+    
+    # Update values
     corrected_ds[discharge_var].values = corrected_2d
     
-    print("✅ B-Morph bias correction complete!")
     return corrected_ds
+
+def apply_bmorph_correction_to_2d_ultra_fast(forecast_2d, nearest_indices, sim_quantiles_grid, obs_quantiles_grid):
+    """
+    ULTRA FAST 2D B-Morph correction - No spatial computations needed!
+    Uses pre-computed nearest neighbors
+    """
+    flat_forecast = forecast_2d.ravel()
+    flat_nearest = nearest_indices.ravel()
+    corrected_flat = flat_forecast.copy()
+    
+    # Only correct non-zero, non-NaN pixels
+    valid_mask = ~np.isnan(flat_forecast) & (flat_forecast > 0)
+    
+    if not np.any(valid_mask):
+        return forecast_2d
+    
+    valid_forecast = flat_forecast[valid_mask]
+    valid_nearest = flat_nearest[valid_mask]
+    
+    # Get correction factors for valid pixels (vectorized indexing)
+    sim_q_matrix = sim_quantiles_grid[valid_nearest, :]  # Shape: (n_valid, n_quantiles)
+    obs_q_matrix = obs_quantiles_grid[valid_nearest, :]  # Shape: (n_valid, n_quantiles)
+    
+    # VECTORIZED INTERPOLATION (can be further optimized with numba)
+    corrected_valid = np.zeros_like(valid_forecast, dtype=np.float32)
+    
+    # Process in chunks to avoid memory issues
+    chunk_size = 10000
+    for i in range(0, len(valid_forecast), chunk_size):
+        end_idx = min(i + chunk_size, len(valid_forecast))
+        
+        for j in range(i, end_idx):
+            try:
+                corrected_valid[j] = np.interp(
+                    valid_forecast[j], 
+                    sim_q_matrix[j, :], 
+                    obs_q_matrix[j, :],
+                    left=obs_q_matrix[j, 0],
+                    right=obs_q_matrix[j, -1]
+                )
+            except:
+                corrected_valid[j] = valid_forecast[j]
+    
+    # Ensure no negative values
+    corrected_valid = np.maximum(corrected_valid, 0.0)
+    
+    # Update only corrected pixels
+    corrected_flat[valid_mask] = corrected_valid
+    
+    return corrected_flat.reshape(forecast_2d.shape)
 
 def save_factors():
 
@@ -532,7 +508,6 @@ def main(forecast_path=None):
     print("=== APPLYING BIAS CORRECTION TO GLOFAS FORECAST ===")
     
     # File paths
-    forecast_path = os.path.join('..','Rst','GloFAS_2019_01_01_f.nc')
     forecast_path = 'tempfile.nc'
     # Load forecast data
     print(f"Loading forecast: {forecast_path}")
@@ -560,16 +535,57 @@ def main(forecast_path=None):
         print("Adding CRS information to forecast...")
         forecast_ds.rio.write_crs("EPSG:32719", inplace=True)
     
+    # =========================================================================
+    # PRE-COMPUTE NEAREST NEIGHBORS ONCE FOR ENTIRE FORECAST GRID
+    # =========================================================================
+    print("Pre-computing nearest neighbors for entire forecast grid...")
+    
+    var_name = list(forecast_ds.data_vars)[0]
+    forecast_data = forecast_ds[var_name]
+    
+    # Get forecast coordinates
+    y_vals = forecast_data.y.values
+    x_vals = forecast_data.x.values
+    
+    print(f"Forecast grid: {len(y_vals)} x {len(x_vals)} = {len(y_vals)*len(x_vals)} points")
+    
+    # Create forecast coordinate grid ONCE
+    forecast_x, forecast_y = np.meshgrid(x_vals, y_vals, indexing='xy')
+    forecast_coords = np.column_stack([forecast_x.ravel(), forecast_y.ravel()])
+    
+    # Build KDTree and query ONCE
+    print("Building KDTree and finding nearest neighbors...")
+    grid_tree = cKDTree(correction_data['grid_coords'])
+    _, nearest_indices = grid_tree.query(forecast_coords, k=1)
+    nearest_indices = nearest_indices.reshape(len(y_vals), len(x_vals))
+    
+    # Add pre-computed indices to correction_data
+    correction_data['nearest_indices'] = nearest_indices
+    correction_data['forecast_shape'] = (len(y_vals), len(x_vals))
+    
+    print(f"✅ Nearest neighbors computed ONCE for entire grid!")
+    
+    # =========================================================================
+    # APPLY CORRECTIONS USING PRE-COMPUTED NEAREST NEIGHBORS
+    # =========================================================================
     forecast_ds_uncorrected = forecast_ds.copy(deep=True)
+    
     # Apply corrections
     print("\nApplying bias corrections...")
+    total_slices = len(forecast_ds['forecast_period']) * len(forecast_ds['number'])
+    processed = 0
+    
     for time in forecast_ds['forecast_period']:
         for number in forecast_ds['number']:
-            print(f"Processing forecast_period={time.values}, number={number.values}")
+            processed += 1
+            if processed % 10 == 0:
+                print(f"Processing slice {processed}/{total_slices}: forecast_period={time.values}, number={number.values}")
+            
             ds_uncorrected = forecast_ds.sel(forecast_period=time, number=number)
-            corrected_ds = apply_bmorph_corrections_to_forecast(ds_uncorrected, correction_data)
+            corrected_ds = apply_bmorph_corrections_fast(ds_uncorrected, correction_data)
             forecast_ds.loc[dict(forecast_period=time, number=number)] = corrected_ds
     
+    print("✅ BIAS CORRECTION COMPLETE!")
     # # Save corrected forecast
     # output_path = forecast_path.replace('.nc', '_bias_corrected_3.nc')
     # print(f"\nSaving corrected forecast: {output_path}")
