@@ -8,6 +8,7 @@ import pickle
 from scipy.interpolate import griddata
 from scipy.stats import rankdata
 from scipy.interpolate import interp1d
+import shapely.geometry as sg
 
 # Compute NSE between ds_nat and df_pivot
 def nash_sutcliffe_efficiency(observed, simulated, min_n=6000):
@@ -167,12 +168,16 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
     Apply Quantile Delta Mapping to forecast: corrected = f + δ(f)
     Only non-zero, non-NaN pixels are modified.
     """
-    grid_f = correction_data['grid_correction_factors']
-    grid_coords = correction_data['grid_coords']
-    obs_q = grid_f['obs_quantiles']
-    sim_q = grid_f['sim_quantiles']
-    dlt_q = grid_f['delta_quantiles']
-    ql   = grid_f['quantile_levels']
+    # grid_f = correction_data['grid_correction_factors']
+    # grid_coords = correction_data['grid_coords']
+    # obs_q = grid_f['obs_quantiles']
+    # sim_q = grid_f['sim_quantiles']
+    # dlt_q = grid_f['delta_quantiles']
+    # ql   = grid_f['quantile_levels']
+    grid_coords     = correction_data['grid_coords']
+    sim_q           = correction_data['sim_quantiles']
+    dlt_q           = correction_data['delta_quantiles']
+    ql              = correction_data['quantile_levels']
 
     # extract forecast array & coords
     if isinstance(forecast_ds, xr.DataArray):
@@ -196,7 +201,7 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
 
     def _corr2d(data2d):
         flat = data2d.ravel()
-        ni   = flat.copy()
+        # ni   = flat.copy()
         m = (~np.isnan(flat)) & (flat > 0)
         vals = flat[m]
         nn   = idx[m]
@@ -206,7 +211,9 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
         out = flat.copy()
         for i, v in enumerate(vals):
             try:
-                d = np.interp(v, sq[i], dq[i],
+                q_level = np.interp(v, sq[i], 
+                                    ql,left=ql[0], right=ql[-1])
+                d = np.interp(q_level, ql, dq[i],
                               left=dq[i,0], right=dq[i,-1])
                 out_idx = np.where(m)[0][i]
                 out[out_idx] = max(v + d, 0.0)
@@ -386,22 +393,29 @@ if len(common_dates) > 0 and len(common_stations) > 0:
     # =============================================================================
     print("\n=== SAVING CORRECTION FACTORS ===")
     
-    correction_data = {
-        'grid_correction_factors': grid_correction_factors,
-        'grid_coords': grid_coords,
-        'grid_shape': (len(coord1_vals), len(coord2_vals)),
-        'station_correction_factors': correction_factors_stations,
-        'station_coords': station_coords_dict,
-        'nse_results': nse_results,
-        'training_period': f"{ds_nat.index.min().date()} to {ds_nat.index.max().date()}",
-        'creation_date': pd.Timestamp.now(),
-        'n_stations': len(correction_factors_stations),
-        'n_grid_points': len(grid_coords)
-    }
+    # correction_data = {
+    #     'grid_correction_factors': grid_correction_factors,
+    #     'grid_coords': grid_coords,
+    #     'grid_shape': (len(coord1_vals), len(coord2_vals)),
+    #     'station_correction_factors': correction_factors_stations,
+    #     'station_coords': station_coords_dict,
+    #     'nse_results': nse_results,
+    #     'training_period': f"{ds_nat.index.min().date()} to {ds_nat.index.max().date()}",
+    #     'creation_date': pd.Timestamp.now(),
+    #     'n_stations': len(correction_factors_stations),
+    #     'n_grid_points': len(grid_coords)
+    # }
     
+    light_correction_data = {
+        'grid_coords':       grid_coords.astype(np.float32),
+        'grid_shape':        (len(coord1_vals), len(coord2_vals)),
+        'quantile_levels':   grid_correction_factors['quantile_levels'].astype(np.float32),
+        'sim_quantiles':     grid_correction_factors['sim_quantiles'].astype(np.float32),
+        'delta_quantiles':   grid_correction_factors['delta_quantiles'].astype(np.float32),
+    }
     # Save correction factors
     with open('../output/historical_correction_factors.pkl', 'wb') as f:
-        pickle.dump(correction_data, f)
+        pickle.dump(light_correction_data, f)
     
     # Save NSE results
     nse_df = pd.DataFrame(list(nse_results.items()), columns=['Station', 'NSE'])
@@ -409,7 +423,7 @@ if len(common_dates) > 0 and len(common_stations) > 0:
     
     # Save summary
     summary_stats = {
-        'Training Period': correction_data['training_period'],
+        # 'Training Period': light_correction_data['training_period'],
         'Stations with Corrections': len(correction_factors_stations),
         'Total Stations Evaluated': len(common_stations),
         'Grid Points': len(grid_coords),
@@ -418,7 +432,7 @@ if len(common_dates) > 0 and len(common_stations) > 0:
     }
     
     summary_df = pd.DataFrame(list(summary_stats.items()), columns=['Metric', 'Value'])
-    summary_df.to_csv('../output/correction_factors_summary.csv', index=False)
+    # summary_df.to_csv('../output/correction_factors_summary.csv', index=False)
     
     print("✅ HISTORICAL CORRECTION FACTORS CREATED AND SAVED!")
     print(f"   📁 Correction factors: ../output/historical_correction_factors.pkl")
@@ -455,9 +469,9 @@ def main():
     with open(correction_factors_path, 'rb') as f:
         correction_data = pickle.load(f)
         print(f"✅ Correction factors loaded successfully")
-        print(f"   Training period: {correction_data['training_period']}")
-        print(f"   Number of stations: {correction_data['n_stations']}")
-        print(f"   Grid points: {correction_data['n_grid_points']}")
+        # print(f"   Training period: {correction_data['training_period']}")
+        # print(f"   Number of stations: {correction_data['n_stations']}")
+        # print(f"   Grid points: {correction_data['n_grid_points']}")
     
     # Ensure forecast has CRS information
     if not hasattr(forecast_ds, 'rio') or forecast_ds.rio.crs is None:
@@ -472,20 +486,38 @@ def main():
     # Apply corrections
     print("\nApplying bias corrections...")
     corrected_ds = apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data)
+
     
     # Save corrected forecast
-    output_path = forecast_path.replace('.nc', '_bias_corrected.nc')
+    output_path = forecast_path.replace('.nc', '_bias_corrected_QDM.nc')
     print(f"\nSaving corrected forecast: {output_path}")
     
-    # Add metadata
-    corrected_ds.attrs['bias_correction_applied'] = 'True'  # String instead of boolean
-    corrected_ds.attrs['correction_training_period'] = correction_data['training_period']
-    corrected_ds.attrs['correction_creation_date'] = str(correction_data['creation_date'])
-    corrected_ds.attrs['correction_stations_used'] = str(correction_data['n_stations'])  # Convert to string
+    # 1) bake in the CRS
+    corrected_ds = corrected_ds.rio.write_crs("EPSG:32719", inplace=False)
 
-    corrected_ds.to_netcdf(output_path,encoding={
-        '__xarray_dataarray_variable__': {'dtype': 'float32', 'zlib': True, 'complevel': 5}
+    # 2) rename dims/coords to CF-style
+    corrected_ds["x"].attrs.update({
+        "standard_name": "projection_x_coordinate",
+        "units": "m"
     })
+    corrected_ds["y"].attrs.update({
+        "standard_name": "projection_y_coordinate",
+        "units": "m"
+    })
+
+    # 3) drop any old grid_mapping encodings (rioxarray has just injected a spatial_ref var with correct attrs)
+    for v in corrected_ds.data_vars:
+        corrected_ds[v].encoding.pop("grid_mapping", None)
+
+    # 4) write out with xarray
+    corrected_ds.to_netcdf(
+        output_path,
+        encoding={
+            var: {"dtype": "float32", "zlib": True, "complevel": 5}
+            for var in corrected_ds.data_vars
+        }
+
+    )
     
     print("✅ BIAS CORRECTION COMPLETE!")
     print(f"   📁 Original forecast: {forecast_path}")

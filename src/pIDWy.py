@@ -4,17 +4,21 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from numba import jit, prange
-import time
 import geopandas as gpd
 import xarray as xr
 import numpy as np
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
-
+_RASTER_CACHE = {
+'bounds': None,      # (x0, x1, y0, y1, width, height)
+'transform': None,   # affine.Transform
+'coords': None,      # {'y': array, 'x': array}
+'geoms': None        # cached list of geometries
+}
 # === OPTIMIZED JIT FUNCTIONS ===
 @jit(nopython=True, parallel=True, cache=True)
 def vectorized_idw_3d(stream_coords_3d, glofas_coords_3d, glofas_q_values, 
-                      max_dist_2d, p=2.0):
+                      max_dist_2d=15000, p=2.0):
     """Ultra-fast vectorized 3D IDW computation"""
     n_streams = stream_coords_3d.shape[0]
     n_glofas = glofas_coords_3d.shape[0]
@@ -86,12 +90,11 @@ def build_glofas_gdf(dis, lats, lons, target_crs):
     glofas_gdf = gpd.GeoDataFrame(
         {'Q': qs},
         geometry=gpd.points_from_xy(xs, ys),
-        crs="EPSG:4326"
-    ).to_crs(target_crs)
+        crs="EPSG:32719")
     return glofas_gdf
 
 # === 2. Extract elevation at GloFAS points ===
-def extract_elevations(glofas_gdf):
+def extract_elevations(glofas_gdf, ELEV_RASTER):
     # Vectorized coordinate extraction
     glofas_coords = np.column_stack([glofas_gdf.geometry.x, glofas_gdf.geometry.y])
     
@@ -104,7 +107,7 @@ def extract_elevations(glofas_gdf):
     return glofas_gdf
 
 # === 3. Load stream segments ===
-def load_stream_data(stream_file):
+def load_stream_data(stream_file, target_crs="EPSG:32719"):
     streams = gpd.read_file(stream_file).to_crs(target_crs)
     if "segment_id" not in streams.columns:
         streams["segment_id"] = streams.index.astype(str)
@@ -116,7 +119,7 @@ def load_stream_data(stream_file):
     return streams, stream_coords
 
 # === 4. Extract elevation at stream points ===
-def extract_stream_elevations():
+def extract_stream_elevations(stream_coords, ELEV_RASTER):
     with rasterio.open(ELEV_RASTER) as src:
         stream_elev = np.array([val[0] for val in src.sample(stream_coords)])
     return stream_elev
@@ -140,7 +143,7 @@ def prepare_3d_coordinates(glofas_gdf, stream_coords, stream_elev,
 
 # === 6. IDW with 3D distance ===
 def compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf, 
-                stream_elev, max_dist=15000, p=2.0):
+                stream_elev, stream_coords, max_dist=15000, p=2.0):
     print(f"   Processing {len(stream_coords_3d)} stream points with {len(glofas_coords_3d)} GloFAS points")
     
     # Handle NaN elevations efficiently
@@ -191,7 +194,7 @@ def compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf,
     return idw_values
 
 # === 7. Assign interpolated discharge to stream segments ===
-def assign_results(streams,col="Q_assigned_3d_idw",
+def assign_results(streams,col="_Q_",
                    idw_values_3d=None):
     streams[col] = idw_values_3d
     
@@ -206,108 +209,170 @@ def assign_results(streams,col="Q_assigned_3d_idw",
     
     return streams_clean
 
-# === 8. Save output ===
-# Clean the dataframe before saving
-def save_results():
-    streams_clean.to_file("streams_3d_idw_optimized.gpkg",
-                        driver="GPKG")
+def gdf2raster_cached(gdf, template_2d, col='Q_assigned_3d_idw', res=250, fill=0):
+    """Ultra-fast cached rasterize using template_2d for bounds/transform."""
+    global _RASTER_CACHE
 
-def gdf2raster(gdf,
-                col='Q_assigned_3d_idw',
-                res=500, fill=np.nan):
-    """    Convert a GeoDataFrame to a raster using a specified column for values.
-    Args:
-        gdf (GeoDataFrame): Input GeoDataFrame with geometries and values.
-        col (str): Column name in GeoDataFrame to use for raster values.
-        res (int): Resolution of the output raster in pixels.
-        fill (float): Value to fill empty pixels in the raster.
-    Returns:
-        xr.DataArray: Rasterized data as an xarray DataArray.
-    """
-    # Ensure the GeoDataFrame has the specified column
-    # Ultra-fast optimized
-    res, col = 500, col
-    x_min, x_max, y_min, y_max = dis_utm.x.min(), dis_utm.x.max(), dis_utm.y.min(), dis_utm.y.max()
-    width, height = int(np.ceil((x_max - x_min) / res)), int(np.ceil((y_max - y_min) / res))
+    # 1) initialize bounds/transform/coords from template_2d
+    if _RASTER_CACHE['bounds'] is None:
+        x0, x1 = template_2d.x.min().item(), template_2d.x.max().item()
+        y0, y1 = template_2d.y.min().item(), template_2d.y.max().item()
+        w = int(np.ceil((x1 - x0) / res))
+        h = int(np.ceil((y1 - y0) / res))
+        tf = from_bounds(x0, y0, x1, y1, w, h)
+        ys = np.linspace(y1, y0, h, dtype='float64')
+        xs = np.linspace(x0, x1, w, dtype='float64')
+        _RASTER_CACHE.update({
+            'bounds': (x0, x1, y0, y1, w, h),
+            'transform': tf,
+            'coords': {'y': ys, 'x': xs}
+        })
 
-    # Fixed rasterize call
-    valid = gdf.dropna(subset=[col])
+    x0, x1, y0, y1, w, h = _RASTER_CACHE['bounds']
+    tf = _RASTER_CACHE['transform']
+    coords = _RASTER_CACHE['coords']
+
+    # 2) cache geometries once
+    if _RASTER_CACHE['geoms'] is None:
+        _RASTER_CACHE['geoms'] = list(gdf.geometry)
+
+    geoms = _RASTER_CACHE['geoms']
+    vals = gdf[col].fillna(fill).to_numpy()
+
+    # 3) generator of (geom, value) pairs
+    shapes = ((geom, v) for geom, v in zip(geoms, vals))
+
+    # 4) rasterize
     raster = rasterize(
-        shapes=[(g, v) for g, v in zip(valid.geometry, valid[col])], 
-        out_shape=(height, width), 
-        transform=from_bounds(x_min, y_min, x_max, y_max, width, height),
-        fill=0, 
-        all_touched=True, 
+        shapes=shapes,
+        out_shape=(h, w),
+        transform=tf,
+        fill=fill,
+        all_touched=True,
         dtype='float32'
     )
 
-    # Save
-    da=xr.DataArray(raster, coords={'y': np.linspace(y_max, y_min, height), 
-                                'x': np.linspace(x_min, x_max, width)}, 
-                dims=['y', 'x']).rio.write_crs(gdf.crs)
+    # 5) return DataArray (defer .rio.write_crs to after concat)
+    return xr.DataArray(raster, coords=coords, dims=['y', 'x'])
 
-    print(f"✅ {np.sum(~np.isnan(raster))} pixels")
-    return da
+def interp_glofas(glofas_nc="nc_test.nc"):
+    """
+    Main function to interpolate GloFAS discharge data onto stream segments.
+    This function handles the entire workflow from loading data to saving results.
+    """
+    # === 0. Setup ===
+    print("Starting GloFAS interpolation...")
+    # === PARAMETERS ===    
+    stream_file = "../geodata/riverQ.gpkg"
+    target_crs = "EPSG:32719"
+    col='_Q_'
+    ELEV_RASTER= "../Rst/dem90fill.tif"
 
-# === PARAMETERS ===
-glofas_nc = "../Rst/GloFAS_2025_06_13_f.nc"
-glofas_nc='../Rst/dis_1980_2018_clip.nc'
-var_name = "dis"
-time_idx = 0
-ELEV_RASTER= "../Rst/dem90fill.tif"
-stream_file = "../geodata/riverQ.gpkg"
-target_crs = "EPSG:32719"
-col='Q_assigned_3d_idw'
-p = 2  # IDW power parameter
-elev_scale = 0.1  # Scale factor for elevation to match horizontal distance units
-max_dist = 15000  # Max distance in meters for considering neighbors
+    # === 0. Setup ===
+    # === 1. Load GloFAS discharge and convert to grid polygons ===
+    ds_clipped = xr.open_dataset(glofas_nc)
+    geopath='RegionCoquimbo.geojson'
+    shapefile = gpd.read_file(geopath)
+    ds_clipped["longitude"] = ds_clipped["longitude"].where(ds_clipped["longitude"] <= 180, ds_clipped["longitude"] - 360)
+    ds_clipped = ds_clipped.rio.write_crs("EPSG:4326")
+    shapefile = shapefile.to_crs("EPSG:4326")
 
-ras_list = []
-# === 0. Setup ===
-# === 1. Load GloFAS discharge and convert to grid polygons ===
-ds = xr.open_dataset(glofas_nc)
-times = ds['time'].values
-streams, stream_coords = load_stream_data(stream_file)
-
-for time in times:
-    dis = ds[var_name].sel(time=time)
-    lat_name = [dim for dim in dis.dims if 'lat' in str(dim)][0]
-    lon_name = [dim for dim in dis.dims if 'lon' in str(dim)][0]
-    lats = dis[lat_name].values
-    lons = dis[lon_name].values
-
-    dis.rio.write_crs("EPSG:4326", inplace=True)
-    dis_utm=dis.rio.reproject(target_crs)
+    # Alternative: Keep all ensemble members in a 5D array
+    template_2d = ds_clipped['dis24'].isel(forecast_period=0, forecast_reference_time=0, number=0).rio.reproject(target_crs)
 
     # Usage:
     # glofas_gdf = build_glofas_gdf(dis, lats, lons, target_crs)
-    glofas_gdf = build_glofas_gdf(dis, lats, lons, target_crs)
+    lat_name = 'y'
+    lon_name = 'x'
+    lats = template_2d[lat_name].values
+    lons = template_2d[lon_name].values
 
-    glofas_gdf = extract_elevations(glofas_gdf)
+    #### reproject all scenarios
 
-    stream_elev = extract_stream_elevations()
-    # === 5. Create 3D coordinates for BallTree ===
-    # Scale elevation to match horizontal distance units
+    shape = (
+        len(ds_clipped['forecast_period']), 
+        len(ds_clipped['forecast_reference_time']), 
+        len(ds_clipped['number']),
+        len(template_2d.y), 
+        len(template_2d.x)
+    )
 
-    glofas_coords_3d, stream_coords_3d = prepare_3d_coordinates(glofas_gdf, stream_coords, stream_elev)
+    ds_utm = xr.DataArray(
+        np.full(shape, np.nan, dtype=ds_clipped['dis24'].dtype),
+        dims=['forecast_period', 'forecast_reference_time', 'number', 'y', 'x'],
+        coords={
+            'forecast_period': ds_clipped['forecast_period'], 
+            'forecast_reference_time': ds_clipped['forecast_reference_time'],
+            'number': ds_clipped['number'],
+            'y': template_2d.y, 
+            'x': template_2d.x
+        },
+        name='dis24'
+    ).rio.write_crs(target_crs)
 
-    idw_values_3d = compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf, 
-                stream_elev)
+    # Reproject all slices
+    for i in range(len(ds_clipped['forecast_period'])):
+        for j in range(len(ds_clipped['forecast_reference_time'])):
+            for k in range(len(ds_clipped['number'])):
+                slice_2d = ds_clipped['dis24'].isel(forecast_period=i, forecast_reference_time=j, number=k)
+                reprojected_2d = slice_2d.rio.reproject_match(template_2d)
+                ds_utm[i, j, k, :, :] = reprojected_2d.values
 
-    streams_clean = assign_results(streams,col,
-                   idw_values_3d)
+    print("✅ Reprojection with all ensemble members complete!")
 
-    ###### tests
+    # load streams and retrieve coordinates
+    streams, stream_coords = load_stream_data(stream_file, target_crs)
 
-    ras = gdf2raster(streams_clean,
-                col=col,
-                res=500, fill=np.nan)
+    # sample stream elevations at stream coordinates
+    stream_elev = extract_stream_elevations(stream_coords,ELEV_RASTER)
 
-    ras_list.append(ras)
+    ras_list = []
 
-# === 9. Save results ===
-ras_combined = xr.concat(ras_list, dim='time')
-ras_combined = ras_combined.assign_coords(
-    time=pd.to_datetime(times)).rename({'time': 'time'})
-ras_combined.rio.write_crs(target_crs, inplace=True)
-ras_combined.to_netcdf("dis_3d_idw_optimized_1980_2018.nc")
+    for i, time_ in enumerate(ds_utm['forecast_period']):
+        ras_time_list = []
+        for j, ensemble in enumerate(ds_utm['number']):
+            print(f"Processing time {i+1}/{len(ds_utm['forecast_period'])}, ensemble {j+1}/{len(ds_utm['number'])}...")
+
+            dis_utm = ds_utm.sel(forecast_period=time_, number=ensemble)
+
+            # === 5. Create 3D coordinates for BallTree ===
+            # Scale elevation to match horizontal distance units
+            glofas_gdf = build_glofas_gdf(dis_utm, lats, lons, target_crs)
+            glofas_gdf = extract_elevations(glofas_gdf, ELEV_RASTER)
+            
+            glofas_coords_3d, stream_coords_3d = prepare_3d_coordinates(glofas_gdf, stream_coords, stream_elev)
+
+            idw_values_3d = compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf, stream_elev, stream_coords)
+
+            streams_clean = assign_results(streams, col, idw_values_3d)
+
+            # Create raster
+            ras = gdf2raster_cached(streams_clean, template_2d, col=col, res=250, fill=np.nan)
+            ras_time_list.append(ras)
+        
+        # Combine ensemble members for this time step
+        ras_time_combined = xr.concat(ras_time_list, dim='number')
+        ras_time_combined = ras_time_combined.assign_coords(number=ds_utm['number'].values)
+        ras_list.append(ras_time_combined)
+
+    # === 9. Combine all time steps ===
+    ras_combined = xr.concat(ras_list, dim='forecast_period')
+    ras_combined = ras_combined.assign_coords(forecast_period=ds_utm['forecast_period'].values)
+
+    # Set proper CRS and save
+    ras_combined.rio.write_crs(target_crs, inplace=True)
+
+    return ras_combined
+
+def main():
+    glofas_nc = "nc_test.nc"  # Path to your GloFAS NetCDF file
+    result = interp_glofas(glofas_nc)
+    
+    # Save the result to a NetCDF file
+    output_path = "glofas_interpolated.nc"
+    result.to_netcdf(output_path)
+    print(f"Results saved to {output_path}")
+
+if __name__ == "__main__":
+    main()
+    # Run the main function

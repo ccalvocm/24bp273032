@@ -2,12 +2,10 @@ import pandas as pd
 import geopandas as gpd
 import os
 import xarray as xr
-import rioxarray as rxr
 import numpy as np
-import pickle
 from scipy.interpolate import griddata
-from scipy.stats import rankdata
-from scipy.interpolate import interp1d
+import shapely.geometry as sg
+from scipy.spatial import cKDTree
 
 # Compute NSE between ds_nat and df_pivot
 def nash_sutcliffe_efficiency(observed, simulated, min_n=6000):
@@ -260,7 +258,7 @@ def interpolate_correction_factors_to_grid(station_coords, station_corrections, 
     print("✅ Grid interpolation complete with artifact reduction!")
     return grid_correction_factors
 
-def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, chunk_size=50000):
+def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data):
     """
     Optimized version - ONLY corrects non-zero, non-NaN pixels
     Preserves zeros and NaNs in original forecast
@@ -272,32 +270,23 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
     grid_coords = correction_data['grid_coords']
     
     # Handle both Dataset and DataArray cases
-    if isinstance(forecast_ds, xr.DataArray):
-        forecast_data = forecast_ds
-        discharge_var = forecast_ds.name or 'dis24'
-    else:
-        var_names = list(forecast_ds.data_vars)
-        discharge_var = var_names[0]
-        forecast_data = forecast_ds[discharge_var]
+
+    var_names = list(forecast_ds.data_vars)
+    discharge_var = var_names[0]
+    forecast_data = forecast_ds[discharge_var]
     
     # Get forecast coordinates
-    if 'lat' in forecast_data.dims:
-        y_vals = forecast_data.lat.values
-        x_vals = forecast_data.lon.values
-    elif 'y' in forecast_data.dims:
-        y_vals = forecast_data.y.values
-        x_vals = forecast_data.x.values
-    else:
-        raise ValueError("Cannot find spatial dimensions")
-    
+    y_vals = forecast_data.y.values
+    x_vals = forecast_data.x.values
+
     print(f"Forecast grid: {len(y_vals)} x {len(x_vals)} = {len(y_vals)*len(x_vals)} points")
     
     # PRE-COMPUTE NEAREST NEIGHBORS (ONCE!)
     print("Pre-computing nearest neighbors...")
     forecast_x, forecast_y = np.meshgrid(x_vals, y_vals, indexing='xy')
-    forecast_coords = np.column_stack([forecast_x.ravel(), forecast_y.ravel()])
+    forecast_coords = np.column_stack([forecast_x.ravel(), 
+                                       forecast_y.ravel()])
     
-    from scipy.spatial import cKDTree
     grid_tree = cKDTree(grid_coords)
     _, nearest_indices = grid_tree.query(forecast_coords, k=1)
     nearest_indices = nearest_indices.reshape(len(y_vals), len(x_vals))
@@ -305,7 +294,6 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
     # PRE-EXTRACT CORRECTION FACTORS
     obs_quantiles = grid_correction_factors['obs_quantiles']  # Shape: (n_grid, n_quantiles)
     sim_quantiles = grid_correction_factors['sim_quantiles']
-    quantile_levels = grid_correction_factors['quantile_levels']
     
     print("Creating interpolation functions...")
     
@@ -321,10 +309,6 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
         
         # CRITICAL: Only correct non-zero, non-NaN pixels
         correction_mask = ~np.isnan(flat_forecast) & (flat_forecast > 0)
-        
-        if not np.any(correction_mask):
-            print("  No non-zero, non-NaN pixels to correct")
-            return forecast_2d
         
         n_to_correct = np.sum(correction_mask)
         print(f"  Correcting {n_to_correct} non-zero, non-NaN pixels out of {len(flat_forecast)} total")
@@ -362,239 +346,247 @@ def apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data, c
         return corrected_flat.reshape(forecast_2d.shape)
     
     # Process time steps
-    if 'time' in forecast_data.dims:
-        n_times = len(forecast_data.time)
-        
-        for t_idx in range(n_times):
-            print(f"Processing time step {t_idx+1}/{n_times}")
-            
-            # Get forecast values for this time step
-            forecast_2d = forecast_data.isel(time=t_idx).values
-            
-            # Apply vectorized correction (only to non-zero, non-NaN)
-            corrected_2d = apply_correction_vectorized(forecast_2d)
-            
-            # Update the corrected dataset
-            if isinstance(forecast_ds, xr.DataArray):
-                corrected_ds.values[t_idx, :, :] = corrected_2d
-            else:
-                corrected_ds[discharge_var].values[t_idx, :, :] = corrected_2d
-    else:
-        # Single time slice
-        print("Processing single time slice")
-        forecast_2d = forecast_data.values
-        corrected_2d = apply_correction_vectorized(forecast_2d)
-        
-        if isinstance(forecast_ds, xr.DataArray):
-            corrected_ds.values = corrected_2d
-        else:
-            corrected_ds[discharge_var].values = corrected_2d
+
+    # Single time slice
+    print("Processing single time slice")
+    forecast_2d = forecast_data.values
+    corrected_2d = apply_correction_vectorized(forecast_2d)
+    corrected_ds[discharge_var].values = corrected_2d
     
     print("✅ Bias correction complete!")
     return corrected_ds
 
-# =============================================================================
-# MAIN WORKFLOW: CREATE HISTORICAL CORRECTION FACTORS
-# =============================================================================
+def save_factors():
+    # =============================================================================
+    # MAIN WORKFLOW: CREATE HISTORICAL CORRECTION FACTORS
+    # =============================================================================
 
-print("=== CREATING HISTORICAL CORRECTION FACTORS ===")
+    print("=== CREATING HISTORICAL CORRECTION FACTORS ===")
 
-file=os.path.join('..','output','caudal_diario_historico_4.txt')
-df=pd.read_csv(file, sep=',', encoding='latin1')
+    file=os.path.join('..','output','caudal_diario_historico_4.txt')
+    df=pd.read_csv(file, sep=',', encoding='latin1')
 
-# metadata
-metadata=df.copy()
-metadata=pd.pivot_table(metadata, index='NOMBRE ESTACION', values=['UTM_ESTE', 'UTM_NORTE'], aggfunc='first')
-gdf= gpd.GeoDataFrame(metadata, geometry=gpd.points_from_xy(metadata['UTM_ESTE'], metadata['UTM_NORTE']), crs='EPSG:32719')
-gdf=gdf.to_crs('EPSG:32719')
-stream_names=['RIO','ESTERO','QUEBRADA']
-gdf_nat=gdf[gdf.index.str.contains('|'.join(stream_names))].copy()
-gdf_nat.to_file(os.path.join('..',
-                             'geodata',
-                             'estaciones_DGA.geojson'),
-                              driver='GeoJSON')
+    # metadata
+    metadata=df.copy()
+    metadata=pd.pivot_table(metadata, index='NOMBRE ESTACION', values=['UTM_ESTE', 'UTM_NORTE'], aggfunc='first')
+    gdf= gpd.GeoDataFrame(metadata, geometry=gpd.points_from_xy(metadata['UTM_ESTE'], metadata['UTM_NORTE']), crs='EPSG:32719')
+    gdf=gdf.to_crs('EPSG:32719')
+    stream_names=['RIO','ESTERO','QUEBRADA']
+    gdf_nat=gdf[gdf.index.str.contains('|'.join(stream_names))].copy()
+    gdf_nat.to_file(os.path.join('..',
+                                'geodata',
+                                'estaciones_DGA.geojson'),
+                                driver='GeoJSON')
 
-# data
-df_pivot=pd.pivot_table(df, index='FECHA', columns='NOMBRE ESTACION', values='Caudal_diario', aggfunc='mean')
-dates=pd.to_datetime(df_pivot.index, format='%d/%m/%Y', errors='coerce', utc=True, dayfirst=True, yearfirst=False, exact=True, infer_datetime_format=False)
-df_pivot.index=dates
-df_pivot=df_pivot[df_pivot.columns[df_pivot.columns.isin(gdf_nat.index)]]
-df_pivot.to_csv(os.path.join('..',
+    # data
+    df_pivot=pd.pivot_table(df, index='FECHA', columns='NOMBRE ESTACION', values='Caudal_diario', aggfunc='mean')
+    dates=pd.to_datetime(df_pivot.index, format='%d/%m/%Y', errors='coerce', utc=True, dayfirst=True, yearfirst=False, exact=True, infer_datetime_format=False)
+    df_pivot.index=dates
+    df_pivot=df_pivot[df_pivot.columns[df_pivot.columns.isin(gdf_nat.index)]]
+    df_pivot.to_csv(os.path.join('..',
+                                'output',
+                                'caudal_diario_historico_4.csv'),
+                                encoding='utf-8',
+                                index_label='FECHA',
+                                date_format='%Y-%m-%dT%H:%M:%S.%fZ',
+                                float_format='%.2f')
+    print("✅ Observed data processed and saved")
+
+    # Load historical model data (1980-2018)
+    path_nc='dis_3d_idw_optimized_1980_2018.nc'
+    ds=xr.open_dataset(path_nc, chunks={'time': 1, 'lat': 500, 'lon': 500})
+    ds.rio.write_crs("EPSG:32719", inplace=True)
+
+    # load forecast netcdf
+    forecast_ds=xr.open_dataset('tempfile.nc')
+    forecast_ds_0=forecast_ds.sel(forecast_period=forecast_ds['forecast_period'].min(),number=1)
+    forecast_ds_0.rio.write_crs("EPSG:32719", inplace=True)
+
+    #  Get bounds
+    bounds = forecast_ds_0.rio.bounds()
+    forecast_bbox = sg.box(*bounds)
+
+    # Create GeoDataFrame
+    forecast_gdf = gpd.GeoDataFrame(
+        [1], 
+        geometry=[forecast_bbox], 
+        crs=forecast_ds_0.rio.crs
+    )
+
+    # Clip historical data to forecast extent
+    ds = ds.rio.clip(forecast_gdf.geometry, 
+                        forecast_gdf.crs, 
+                        drop=True)
+
+    # sample all ds times over gdf_nat points
+    gdf_nat = gdf_nat.to_crs(ds.rio.crs)
+
+    # Fix: Use DataArrays instead of tuples
+    xs = gdf_nat.geometry.x.to_numpy()
+    ys = gdf_nat.geometry.y.to_numpy()
+
+    # Create DataArrays with station names as coordinates
+    station_names = gdf_nat.index.tolist()
+    x_sel = xr.DataArray(xs, dims="points", coords={"points": station_names})
+    y_sel = xr.DataArray(ys, dims="points", coords={"points": station_names})
+
+    # Select using DataArrays
+    ds_nat = ds.sel(x=x_sel, y=y_sel, method="nearest")
+
+    # Convert to dataframe
+    ds_nat = ds_nat.to_dataframe().reset_index()
+
+    # Fix datetime conversion
+    ds_nat['FECHA'] = pd.to_datetime(ds_nat['time'])
+    ds_nat = ds_nat.pivot(index='FECHA', columns='points', values='__xarray_dataarray_variable__')
+
+    print("✅ Model data sampled at station locations")
+
+    # Save sampled model data
+    ds_nat.to_csv(os.path.join('..',
                             'output',
-                            'caudal_diario_historico_4.csv'),
+                            'dis_3d_idw_optimized_1980_2018.csv'),
                             encoding='utf-8',
                             index_label='FECHA',
                             date_format='%Y-%m-%dT%H:%M:%S.%fZ',
                             float_format='%.2f')
-print("✅ Observed data processed and saved")
 
-# Load historical model data (1980-2018)
-path_nc='dis_3d_idw_optimized_1980_2018.nc'
-ds=xr.open_dataset(path_nc, chunks={'time': 1, 'lat': 500, 'lon': 500})
-ds.rio.write_crs("EPSG:32719", inplace=True)
+    # FIX: Align timezone awareness
+    ds_nat.index = pd.to_datetime(ds_nat.index).tz_localize('UTC')
 
-# sample all ds times over gdf_nat points
-gdf_nat = gdf_nat.to_crs(ds.rio.crs)
+    print(f"ds_nat dates: {ds_nat.index.min()} to {ds_nat.index.max()}")
+    print(f"df_pivot dates: {df_pivot.index.min()} to {df_pivot.index.max()}")
 
-# Fix: Use DataArrays instead of tuples
-xs = gdf_nat.geometry.x.to_numpy()
-ys = gdf_nat.geometry.y.to_numpy()
+    # Find common dates and stations
+    common_dates = ds_nat.index.intersection(df_pivot.index)
+    common_stations = ds_nat.columns.intersection(df_pivot.columns)
+    print(f"Common dates: {len(common_dates)}")
+    print(f"Common stations: {len(common_stations)}")
 
-# Create DataArrays with station names as coordinates
-station_names = gdf_nat.index.tolist()
-x_sel = xr.DataArray(xs, dims="points", coords={"points": station_names})
-y_sel = xr.DataArray(ys, dims="points", coords={"points": station_names})
-
-# Select using DataArrays
-ds_nat = ds.sel(x=x_sel, y=y_sel, method="nearest")
-
-# Convert to dataframe
-ds_nat = ds_nat.to_dataframe().reset_index()
-
-# Fix datetime conversion
-ds_nat['FECHA'] = pd.to_datetime(ds_nat['time'])
-ds_nat = ds_nat.pivot(index='FECHA', columns='points', values='__xarray_dataarray_variable__')
-
-print("✅ Model data sampled at station locations")
-
-# Save sampled model data
-ds_nat.to_csv(os.path.join('..',
-                          'output',
-                          'dis_3d_idw_optimized_1980_2018.csv'),
-                          encoding='utf-8',
-                          index_label='FECHA',
-                          date_format='%Y-%m-%dT%H:%M:%S.%fZ',
-                          float_format='%.2f')
-
-# FIX: Align timezone awareness
-ds_nat.index = pd.to_datetime(ds_nat.index).tz_localize('UTC')
-
-print(f"ds_nat dates: {ds_nat.index.min()} to {ds_nat.index.max()}")
-print(f"df_pivot dates: {df_pivot.index.min()} to {df_pivot.index.max()}")
-
-# Find common dates and stations
-common_dates = ds_nat.index.intersection(df_pivot.index)
-common_stations = ds_nat.columns.intersection(df_pivot.columns)
-print(f"Common dates: {len(common_dates)}")
-print(f"Common stations: {len(common_stations)}")
-
-if len(common_dates) > 0 and len(common_stations) > 0:
-    # Subset to common dates and stations
-    ds_common = ds_nat.loc[common_dates, common_stations]
-    df_common = df_pivot.loc[common_dates, common_stations]
-    
-    # =============================================================================
-    # TRAIN CORRECTION FACTORS AT EACH STATION
-    # =============================================================================
-    print("\n=== TRAINING CORRECTION FACTORS ===")
-    
-    correction_factors_stations = {}
-    nse_results = {}
-    station_coords_dict = {}
-    
-    for station in common_stations:
-        observed = df_common[station].values
-        simulated = ds_common[station].values
+    if len(common_dates) > 0 and len(common_stations) > 0:
+        # Subset to common dates and stations
+        ds_common = ds_nat.loc[common_dates, common_stations]
+        df_common = df_pivot.loc[common_dates, common_stations]
         
-        # Calculate NSE for evaluation
-        nse = nash_sutcliffe_efficiency(observed, simulated)
-        nse_results[station] = nse
+        # =============================================================================
+        # TRAIN CORRECTION FACTORS AT EACH STATION
+        # =============================================================================
+        print("\n=== TRAINING CORRECTION FACTORS ===")
         
-        # Train correction factors
-        correction_model = train_quantile_delta_mapping(observed, simulated, n_quantiles=100)
+        correction_factors_stations = {}
+        nse_results = {}
+        station_coords_dict = {}
         
-        if correction_model is not None:
-            correction_factors_stations[station] = correction_model
+        for station in common_stations:
+            observed = df_common[station].values
+            simulated = ds_common[station].values
             
-            # Store station coordinates
-            station_coords_dict[station] = (gdf_nat.loc[station, 'geometry'].x, 
-                                          gdf_nat.loc[station, 'geometry'].y)
+            # Calculate NSE for evaluation
+            nse = nash_sutcliffe_efficiency(observed, simulated)
+            nse_results[station] = nse
             
-            print(f"✅ {station}: NSE = {nse:.3f}, Correction factors trained")
-        else:
-            print(f"❌ {station}: NSE = {nse:.3f}, Insufficient data for correction")
-    
-    print(f"\nTrained correction factors for {len(correction_factors_stations)} stations")
-    
-    # =============================================================================
-    # CREATE MODEL GRID COORDINATES
-    # =============================================================================
-    print("\n=== CREATING GRID COORDINATES ===")
-    
-    # Get grid structure from the model dataset
-    coord1_vals = ds.y.values  # or lat
-    coord2_vals = ds.x.values  # or lon
-    grid_x, grid_y = np.meshgrid(coord2_vals, coord1_vals, indexing='xy')
-    grid_coords = np.column_stack([grid_x.ravel(), grid_y.ravel()])
-    
-    print(f"Model grid: {len(coord1_vals)} x {len(coord2_vals)} = {len(grid_coords)} points")
-    
-    # =============================================================================
-    # INTERPOLATE TO FULL GRID
-    # =============================================================================
-    print("\n=== INTERPOLATING TO FULL GRID ===")
-    
-    grid_correction_factors = interpolate_correction_factors_to_grid(
-        station_coords_dict, 
-        correction_factors_stations, 
-        grid_coords, 
-        method='rbf',             # Changed from 'linear' to 'rbf' to avoid TIN artifacts
-        smooth_sigma=2.0,         # Added spatial smoothing
-        max_change_factor=3.0     # Added outlier capping
-    )
-    
-    # =============================================================================
-    # SAVE HISTORICAL CORRECTION FACTORS
-    # =============================================================================
-    print("\n=== SAVING CORRECTION FACTORS ===")
-    
-    correction_data = {
-        'grid_correction_factors': grid_correction_factors,
-        'grid_coords': grid_coords,
-        'grid_shape': (len(coord1_vals), len(coord2_vals)),
-        'station_correction_factors': correction_factors_stations,
-        'station_coords': station_coords_dict,
-        'nse_results': nse_results,
-        'training_period': f"{ds_nat.index.min().date()} to {ds_nat.index.max().date()}",
-        'creation_date': pd.Timestamp.now(),
-        'n_stations': len(correction_factors_stations),
-        'n_grid_points': len(grid_coords)
-    }
-    
-    # Save correction factors
-    with open('../output/historical_correction_factors.pkl', 'wb') as f:
-        pickle.dump(correction_data, f)
-    
-    # Save NSE results
-    nse_df = pd.DataFrame(list(nse_results.items()), columns=['Station', 'NSE'])
-    nse_df.to_csv(os.path.join('..', 'output', 'nse_results.csv'), index=False)
-    
-    # Save summary
-    summary_stats = {
-        'Training Period': correction_data['training_period'],
-        'Stations with Corrections': len(correction_factors_stations),
-        'Total Stations Evaluated': len(common_stations),
-        'Grid Points': len(grid_coords),
-        'Mean NSE': np.nanmean(list(nse_results.values())),
-        'Stations with NSE > 0.5': np.sum([nse > 0.5 for nse in nse_results.values() if not np.isnan(nse)])
-    }
-    
-    summary_df = pd.DataFrame(list(summary_stats.items()), columns=['Metric', 'Value'])
-    summary_df.to_csv('../output/correction_factors_summary.csv', index=False)
-    
-    print("✅ HISTORICAL CORRECTION FACTORS CREATED AND SAVED!")
-    print(f"   📁 Correction factors: ../output/historical_correction_factors.pkl")
-    print(f"   📁 NSE results: ../output/nse_results.csv") 
-    print(f"   📁 Summary: ../output/correction_factors_summary.csv")
-    print(f"\n🎯 These factors can now be applied to any future forecast!")
-    
-else:
-    print("❌ No common dates or stations found!")
-    print("Check date ranges overlap:")
-    print(f"ds_nat: {ds_nat.index.min()} to {ds_nat.index.max()}")
-    print(f"df_pivot: {df_pivot.index.min()} to {df_pivot.index.max()}")
+            # Train correction factors
+            correction_model = train_quantile_delta_mapping(observed, simulated, n_quantiles=100)
+            
+            if correction_model is not None:
+                correction_factors_stations[station] = correction_model
+                
+                # Store station coordinates
+                station_coords_dict[station] = (gdf_nat.loc[station, 'geometry'].x, 
+                                            gdf_nat.loc[station, 'geometry'].y)
+                
+                print(f"✅ {station}: NSE = {nse:.3f}, Correction factors trained")
+            else:
+                print(f"❌ {station}: NSE = {nse:.3f}, Insufficient data for correction")
+        
+        print(f"\nTrained correction factors for {len(correction_factors_stations)} stations")
+        
+        # =============================================================================
+        # CREATE MODEL GRID COORDINATES
+        # =============================================================================
+        print("\n=== CREATING GRID COORDINATES ===")
+        
+        # Get grid structure from the model dataset
+        coord1_vals = ds.y.values  # or lat
+        coord2_vals = ds.x.values  # or lon
+        grid_x, grid_y = np.meshgrid(coord2_vals, coord1_vals, indexing='xy')
+        grid_coords = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+        
+        print(f"Model grid: {len(coord1_vals)} x {len(coord2_vals)} = {len(grid_coords)} points")
+        
+        # =============================================================================
+        # INTERPOLATE TO FULL GRID
+        # =============================================================================
+        print("\n=== INTERPOLATING TO FULL GRID ===")
+        
+        grid_correction_factors = interpolate_correction_factors_to_grid(
+            station_coords_dict, 
+            correction_factors_stations, 
+            grid_coords, 
+            method='rbf',             # Changed from 'linear' to 'rbf' to avoid TIN artifacts
+            smooth_sigma=2.0,         # Added spatial smoothing
+            max_change_factor=3.0     # Added outlier capping
+        )
+        
+        # =============================================================================
+        # SAVE HISTORICAL CORRECTION FACTORS
+        # =============================================================================
+        print("\n=== SAVING CORRECTION FACTORS ===")
+        
+        correction_data = {
+            'grid_correction_factors': grid_correction_factors,
+            'grid_coords': grid_coords,
+            'grid_shape': (len(coord1_vals), len(coord2_vals)),
+            'station_correction_factors': correction_factors_stations,
+            'station_coords': station_coords_dict,
+            'nse_results': nse_results,
+            'training_period': f"{ds_nat.index.min().date()} to {ds_nat.index.max().date()}",
+            'creation_date': pd.Timestamp.now(),
+            'n_stations': len(correction_factors_stations),
+            'n_grid_points': len(grid_coords)
+        }
+        
+        np.savez_compressed(
+            '../output/historical_correction_factors.npz',
+            sim_quantiles=grid_correction_factors['sim_quantiles'].astype('float16') ,
+            grid_coords=grid_coords.astype('float32') ,
+            obs_quantiles=grid_correction_factors['obs_quantiles'].astype('float16') ,
+        )
 
-print("\n=== HISTORICAL CORRECTION FACTORS CREATION COMPLETE ===")
+        # # Save correction factors
+        # with open('../output/historical_correction_factors.pkl', 'wb') as f:
+        #     pickle.dump(correction_data, f)
+        
+        # Save NSE results
+        nse_df = pd.DataFrame(list(nse_results.items()), columns=['Station', 'NSE'])
+        nse_df.to_csv(os.path.join('..', 'output', 'nse_results.csv'), index=False)
+        
+        # # Save summary
+        # summary_stats = {
+        #     'Training Period': correction_data['training_period'],
+        #     'Stations with Corrections': len(correction_factors_stations),
+        #     'Total Stations Evaluated': len(common_stations),
+        #     'Grid Points': len(grid_coords),
+        #     'Mean NSE': np.nanmean(list(nse_results.values())),
+        #     'Stations with NSE > 0.5': np.sum([nse > 0.5 for nse in nse_results.values() if not np.isnan(nse)])
+        # }
+        
+        # summary_df = pd.DataFrame(list(summary_stats.items()), columns=['Metric', 'Value'])
+        # summary_df.to_csv('../output/correction_factors_summary.csv', index=False)
+        
+        print("✅ HISTORICAL CORRECTION FACTORS CREATED AND SAVED!")
+        print(f"   📁 Correction factors: ../output/historical_correction_factors.pkl")
+        print(f"   📁 NSE results: ../output/nse_results.csv") 
+        print(f"   📁 Summary: ../output/correction_factors_summary.csv")
+        print(f"\n🎯 These factors can now be applied to any future forecast!")
+        
+    else:
+        print("❌ No common dates or stations found!")
+        print("Check date ranges overlap:")
+        print(f"ds_nat: {ds_nat.index.min()} to {ds_nat.index.max()}")
+        print(f"df_pivot: {df_pivot.index.min()} to {df_pivot.index.max()}")
+
+    print("\n=== HISTORICAL CORRECTION FACTORS CREATION COMPLETE ===")
 
 def main():
     """Main function to apply corrections to GloFAS forecast"""
@@ -602,9 +594,8 @@ def main():
     print("=== APPLYING BIAS CORRECTION TO GLOFAS FORECAST ===")
     
     # File paths
-    forecast_path = os.path.join('..','Rst','GloFAS_2019_01_01_f.nc')
-    correction_factors_path = '../output/historical_correction_factors.pkl'
-    
+    forecast_path = 'tempfile.nc'
+        
     # Load forecast data
     print(f"Loading forecast: {forecast_path}")
     forecast_ds = xr.open_dataset(forecast_path)
@@ -613,43 +604,47 @@ def main():
     print(f"   Grid size: {forecast_ds.dims}")
 
     # Load correction factors
-    print(f"Loading correction factors: {correction_factors_path}")
-    with open(correction_factors_path, 'rb') as f:
-        correction_data = pickle.load(f)
-        print(f"✅ Correction factors loaded successfully")
-        print(f"   Training period: {correction_data['training_period']}")
-        print(f"   Number of stations: {correction_data['n_stations']}")
-        print(f"   Grid points: {correction_data['n_grid_points']}")
+    npz = np.load('../output/historical_correction_factors.npz')
+
+    # Build correction_data exactly as apply_bmorph expects
+    correction_data = {
+        'grid_correction_factors': {
+            'sim_quantiles': npz['sim_quantiles'],  # shape (n_grid, n_q)
+            'obs_quantiles': npz['obs_quantiles'],  # shape (n_grid, n_q)
+        },
+        'grid_coords': npz['grid_coords'],
+    }
     
     # Ensure forecast has CRS information
     if not hasattr(forecast_ds, 'rio') or forecast_ds.rio.crs is None:
         print("Adding CRS information to forecast...")
         forecast_ds.rio.write_crs("EPSG:32719", inplace=True)
     
-    # Convert to UTM if needed (to match correction factors)
-    if str(forecast_ds.rio.crs) != "EPSG:32719":
-        print("Reprojecting forecast to UTM 19S...")
-        forecast_ds = forecast_ds['__xarray_dataarray_variable__'].rio.reproject("EPSG:32719")
-    
     # Apply corrections
     print("\nApplying bias corrections...")
-    corrected_ds = apply_grid_corrections_to_forecast_optimized(forecast_ds, correction_data)
+    forecast_ds_uncorrected = forecast_ds.copy(deep=True)
+    # Apply corrections
+    print("\nApplying bias corrections...")
+    for time in forecast_ds['forecast_period']:
+        for number in forecast_ds['number']:
+            print(f"Processing forecast_period={time.values}, number={number.values}")
+            ds_uncorrected = forecast_ds.sel(forecast_period=time, number=number)
+            corrected_ds = apply_grid_corrections_to_forecast_optimized(ds_uncorrected, correction_data)
+            forecast_ds.loc[dict(forecast_period=time, number=number)] = corrected_ds
     
     # Save corrected forecast
-    output_path = forecast_path.replace('.nc', '_bias_corrected.nc')
+    output_path = forecast_path.replace('.nc', '_bias_corrected_QuantileMapping.nc')
     print(f"\nSaving corrected forecast: {output_path}")
-    
-    print(f"\nSaving corrected forecast: {output_path}")
-    
+        
     # 1) bake in the CRS
     corrected_ds = corrected_ds.rio.write_crs("EPSG:32719", inplace=False)
 
     # 2) rename dims/coords to CF-style
-    corrected_ds["lon"].attrs.update({
+    corrected_ds["x"].attrs.update({
         "standard_name": "projection_x_coordinate",
         "units": "m"
     })
-    corrected_ds["lat"].attrs.update({
+    corrected_ds["y"].attrs.update({
         "standard_name": "projection_y_coordinate",
         "units": "m"
     })
