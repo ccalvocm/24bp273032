@@ -592,18 +592,7 @@ def main(forecast_path=None):
             forecast_ds.loc[dict(forecast_period=time, number=number)] = corrected_ds
     
     print("✅ BIAS CORRECTION COMPLETE!")
-    # # Save corrected forecast
-    # output_path = forecast_path.replace('.nc', '_bias_corrected_3.nc')
-    # print(f"\nSaving corrected forecast: {output_path}")
 
-    # corrected_ds.to_netcdf(output_path,encoding={
-    #     '__xarray_dataarray_variable__': {'dtype': 'float32', 'zlib': True, 'complevel': 5}
-    # })
-    
-    print("✅ BIAS CORRECTION COMPLETE!")
-    # print(f"   📁 Original forecast: {forecast_path}")
-    # print(f"   📁 Corrected forecast: {output_path}")
-    
     # Calculate some summary statistics
     print("\n=== CORRECTION SUMMARY ===")
     var_name = list(forecast_ds.data_vars)[0]
