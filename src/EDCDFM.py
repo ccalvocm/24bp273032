@@ -507,6 +507,78 @@ def save_factors():
 
     print("\n=== HISTORICAL CORRECTION FACTORS CREATION COMPLETE ===")
 
+def reproject(tmpfile_interp):
+    # Reproject each 2D slice separately
+    print("Reprojecting to EPSG:4326...")
+    import gc
+    
+    # Create a list to store reprojected slices
+    reprojected_slices = []
+    
+    total_slices = len(tmpfile_interp.forecast_period) * len(tmpfile_interp.number)
+    processed = 0
+
+    for period in tmpfile_interp.forecast_period:
+        period_slices = []
+        
+        for number in tmpfile_interp.number:
+            processed += 1
+            if processed % 10 == 0:
+                print(f"Processing slice {processed}/{total_slices}: period={period.values}, number={number.values}")
+            
+            # Get 2D slice
+            slice_2d = tmpfile_interp.sel(forecast_period=period, number=number)
+            
+            # Reproject the 2D slice
+            reprojected_slice = slice_2d.rio.reproject("EPSG:4326")
+
+            fill_value = reprojected_slice.attrs.get('_FillValue', None)
+
+            reprojected_slice = reprojected_slice.where(reprojected_slice != fill_value, np.nan)
+            reprojected_slice.attrs['_FillValue'] = np.nan
+
+            period_slices.append(reprojected_slice)
+
+            # Clear temporary slice from memory
+            del slice_2d
+            del reprojected_slice
+
+            
+            # Force garbage collection every 5 slices
+            if processed % 5 == 0:
+                gc.collect()
+        
+        # Combine slices for this forecast period
+        period_combined = xr.concat(period_slices, dim='number')
+        period_combined = period_combined.assign_coords(number=tmpfile_interp.number.values)
+        reprojected_slices.append(period_combined)
+        
+        # Clear period slices from memory
+        del period_slices, period_combined
+        gc.collect()
+
+    # Combine all periods
+    print("Combining all reprojected periods...")
+    tmpfile_interp_reprojected = xr.concat(reprojected_slices, dim='forecast_period')
+    tmpfile_interp_reprojected = tmpfile_interp_reprojected.assign_coords(
+        forecast_period=tmpfile_interp.forecast_period.values
+    )
+    
+    # Clear intermediate data
+    del reprojected_slices
+    gc.collect()
+
+    tmpfile_interp_reprojected['dis24'] = tmpfile_interp_reprojected['dis24'].where(
+    tmpfile_interp_reprojected['dis24'] < 1e30, np.nan)
+    # update the _FillValue attribute so downstream writers know
+    tmpfile_interp_reprojected['dis24'].attrs['_FillValue'] = np.nan
+
+    # rename x and y to longitude and latitude
+    tmpfile_interp_reprojected = tmpfile_interp_reprojected.rename({'x': 'longitude', 'y': 'latitude'})
+
+    print("✅ Reprojection complete!")
+    return tmpfile_interp_reprojected 
+
 def bias_correct(ds):
     
     print("=== APPLYING BIAS CORRECTION TO GLOFAS FORECAST ===")
@@ -609,7 +681,9 @@ def bias_correct(ds):
     gc.collect()
     print("✅ BIAS CORRECTION COMPLETE!")
 
-    return forecast_ds
+    forecast_ds = forecast_ds.to_dataset(name='dis24')
+
+    return reproject(forecast_ds)
 
 if __name__ == "__main__":
     corrected_forecast = bias_correct()

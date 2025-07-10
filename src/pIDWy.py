@@ -4,16 +4,10 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from numba import jit, prange
-import geopandas as gpd
-import xarray as xr
-import numpy as np
 from rasterio.features import rasterize
 from rasterio.transform import from_bounds
-from EDCDFM_DGA import apply_bmorph_corrections_fast
-import gc
-import scipy.stats
-import shapely.geometry as sg
-from scipy.spatial import cKDTree
+import EDCDFM
+import gc; gc.collect()
 
 _RASTER_CACHE = {
 'bounds': None,      # (x0, x1, y0, y1, width, height)
@@ -97,6 +91,7 @@ def build_glofas_gdf(dis, lats, lons, target_crs):
         {'Q': qs},
         geometry=gpd.points_from_xy(xs, ys),
         crs="EPSG:32719")
+    del q_arr, lon2d, lat2d, xs, ys, qs
     return glofas_gdf
 
 # === 2. Extract elevation at GloFAS points ===
@@ -196,7 +191,6 @@ def compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf,
                 weights = 1.0 / (d_valid ** p)
                 weights /= weights.sum()
                 idw_values[idx] = np.sum(weights * q_valid)
-    
     return idw_values
 
 # === 7. Assign interpolated discharge to stream segments ===
@@ -261,7 +255,7 @@ def gdf2raster_cached(gdf, template_2d, col='Q_assigned_3d_idw', res=250, fill=0
     # 5) return DataArray (defer .rio.write_crs to after concat)
     return xr.DataArray(raster, coords=coords, dims=['y', 'x'])
 
-def interp_glofas(glofas_nc="nc_test.nc"):
+def interp_glofas(glofas_nc):
     """
     Main function to interpolate GloFAS discharge data onto stream segments.
     This function handles the entire workflow from loading data to saving results.
@@ -276,12 +270,9 @@ def interp_glofas(glofas_nc="nc_test.nc"):
 
     # === 0. Setup ===
     # === 1. Load GloFAS discharge and convert to grid polygons ===
-    ds_clipped = xr.open_dataset(glofas_nc)
-    geopath='RegionCoquimbo.geojson'
-    shapefile = gpd.read_file(geopath)
+    ds_clipped = glofas_nc
     ds_clipped["longitude"] = ds_clipped["longitude"].where(ds_clipped["longitude"] <= 180, ds_clipped["longitude"] - 360)
     ds_clipped = ds_clipped.rio.write_crs("EPSG:4326")
-    shapefile = shapefile.to_crs("EPSG:4326")
 
     # Alternative: Keep all ensemble members in a 5D array
     template_2d = ds_clipped['dis24'].isel(forecast_period=0, forecast_reference_time=0, number=0).rio.reproject(target_crs)
@@ -334,10 +325,18 @@ def interp_glofas(glofas_nc="nc_test.nc"):
             # === REPROJECTION ===
             slice_2d = ds_clipped['dis24'].isel(forecast_period=i, forecast_reference_time=j, number=k)
             dis_utm = slice_2d.rio.reproject_match(template_2d)
+
+             # Clear slice_2d immediately
+            del slice_2d
             
             # === INTERPOLATION ===
             # Build GloFAS points and extract elevations
             glofas_gdf = build_glofas_gdf(dis_utm, lats, lons, target_crs)
+
+            # Clear dis_utm after extracting points
+            del dis_utm
+            gc.collect()
+
             glofas_gdf = extract_elevations(glofas_gdf, ELEV_RASTER)
             
             # Create 3D coordinates
@@ -346,21 +345,41 @@ def interp_glofas(glofas_nc="nc_test.nc"):
             # Compute IDW interpolation
             idw_values_3d = compute_idw(stream_coords_3d, glofas_coords_3d, glofas_gdf, stream_elev, stream_coords)
 
+             # Clear large intermediate arrays
+            del glofas_coords_3d, stream_coords_3d, glofas_gdf
+            gc.collect()
+
             # Assign results to streams
             streams_clean = assign_results(streams, col, idw_values_3d)
+
+            # Clear idw_values_3d
+            del idw_values_3d
 
             # Create raster
             ras = gdf2raster_cached(streams_clean, template_2d, col=col, res=250, fill=np.nan)
             ras_time_list.append(ras)
-        
+
+                        # Clear streams_clean
+            del streams_clean
+            
+            # Force garbage collection every 5 iterations
+            gc.collect()
+
         # Combine ensemble members for this time step
         ras_time_combined = xr.concat(ras_time_list, dim='number')
         ras_time_combined = ras_time_combined.assign_coords(number=ds_clipped['number'].values)
         ras_list.append(ras_time_combined)
 
+        # free per‐time memory
+        del ras_time_list, ras_time_combined
+        gc.collect()
+
     # === 9. Combine all time steps ===
     ras_combined = xr.concat(ras_list, dim='forecast_period')
     ras_combined = ras_combined.assign_coords(forecast_period=ds_clipped['forecast_period'].values)
+
+    # Clear ras_time_list to free memory
+    gc.collect()
 
     print("✅ Combined reprojection and interpolation complete!")
 
@@ -368,15 +387,18 @@ def interp_glofas(glofas_nc="nc_test.nc"):
     ras_combined = xr.concat(ras_list, dim='forecast_period')
     ras_combined = ras_combined.assign_coords(forecast_period=ds_utm['forecast_period'].values)
 
+    # Clear large intermediate variables
+    del ras_list, streams, stream_coords, stream_elev, template_2d, lats, lons
+    gc.collect()
+
     # Set proper CRS and save
     ras_combined.rio.write_crs(target_crs, inplace=True)
 
-    ras_combined.sel(
-        forecast_period=ds_clipped['forecast_period'][-1], 
-        number=ds_clipped['number'][-1]
-    ).plot()
+    # Clear ds_clipped before bias correction
+    del ds_clipped
+    gc.collect()
 
-    return ras_combined
+    return EDCDFM.bias_correct(ras_combined)
 
 def main():
     glofas_nc = "nc_test.nc"  # Path to your GloFAS NetCDF file

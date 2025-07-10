@@ -11,6 +11,7 @@ import rioxarray
 import numpy as np
 import rasterio
 from tempfile import NamedTemporaryFile
+import gc
 from pIDWy import interp_glofas
 
 # Obtener las credenciales desde variables de entorno
@@ -52,18 +53,20 @@ def fetch_rlevel(day, month, year):
         with NamedTemporaryFile(delete=True, suffix=".nc") as tmpfile:
             client.retrieve(dataset, request, tmpfile.name)
             print('Datos descargados, procesando...')
-            tmpfile_interp=interp_glofas(tmpfile.name)
-
-
+            clipped_ds=clip(tmpfile.name)
+            tmpfile_interp=interp_glofas(clipped_ds)
+            tmpfile_interp['forecast_reference_time']=clipped_ds['forecast_reference_time']
+            del clipped_ds
+            gc.collect()  # Liberar memoria
             # tmpfile_interp=interp_glofas(clip(tmpfile.name))
-            return guardar_medias_y_desviaciones(tmpfile_interp.name)
+            return guardar_medias_y_desviaciones(tmpfile_interp)
     except Exception as e:
         print(json.dumps({"error": str(e)}))
         return None
 
 # Función para guardar medias y desviaciones
 def guardar_medias_y_desviaciones(archivo):
-    dataset = xr.open_dataset(archivo)
+    dataset = archivo
     
     if "dis24" not in dataset:
         print("Error: La variable 'dis24' no está en el dataset.")
@@ -83,6 +86,9 @@ def guardar_medias_y_desviaciones(archivo):
     )
 
     output_file = f"download/{year}{month}{day}.nc"
+
+    if not os.path.exists("download"):
+        os.makedirs("download")
     combined_ds.to_netcdf(output_file)
     print(f"Archivo guardado como: {output_file}")
 
@@ -133,12 +139,8 @@ def clip(archivo_nc):
 
     try:
         ds = xr.open_dataset(archivo_nc, decode_timedelta=False)
-        print('LEI ESTO')
-        headers = {"Authorization": f"token {GITHUB_TOKEN}"} if GITHUB_TOKEN else {}
-        response = requests.get(GEOJSON_URL, headers=headers)
-        response.raise_for_status()  # Verifica si hubo un error HTTP
 
-        shapefile = gpd.read_file(BytesIO(response.content))
+        shapefile = gpd.read_file('./RegionCoquimbo.geojson')
         print("GeoJSON cargado correctamente")
 
         ds["longitude"] = ds["longitude"].where(ds["longitude"] <= 180, ds["longitude"] - 360)
@@ -154,7 +156,7 @@ def clip(archivo_nc):
         return None
 
 # Función para hacer clipping y generar GeoTIFFs
-def clip_y_generar_geotiffs(archivo_nc):
+def generar_geotiffs(archivo_nc):
     print(f"Procesando clip y generación de GeoTIFFs para {archivo_nc}...")
 
     try:
@@ -164,28 +166,22 @@ def clip_y_generar_geotiffs(archivo_nc):
         response = requests.get(GEOJSON_URL, headers=headers)
         response.raise_for_status()  # Verifica si hubo un error HTTP
 
-        shapefile = gpd.read_file(BytesIO(response.content))
-        print("GeoJSON cargado correctamente")
-
         ds["longitude"] = ds["longitude"].where(ds["longitude"] <= 180, ds["longitude"] - 360)
-        ds = ds.rio.write_crs("EPSG:4326")
-        shapefile = shapefile.to_crs("EPSG:4326")
-
-        ds_clipped = ds.rio.clip(shapefile.geometry, shapefile.crs, drop=False)
+        ds = ds.rio.clip(shapefile.geometry, shapefile.crs, drop=False)
 
         # Filtrar valores no deseados
-        for var in ds_clipped.data_vars:
-            if ds_clipped[var].dtype in [np.float32, np.float64]:
-                ds_clipped[var] = ds_clipped[var].where(ds_clipped[var] >= 0.1)
+        for var in ds.data_vars:
+            if ds[var].dtype in [np.float32, np.float64]:
+                ds[var] = ds[var].where(ds[var] >= 0.1)
 
-        mean_dis24 = ds_clipped['mean_dis24']
+        mean_dis24 = ds['mean_dis24']
         output_dir = "frontend/public/geotiff/resultados/"
 
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        for i, forecast_period_value in enumerate(ds_clipped['forecast_period']):
-            for j in range(len(ds_clipped['forecast_reference_time'])):
+        for i, forecast_period_value in enumerate(ds['forecast_period']):
+            for j in range(len(ds['forecast_reference_time'])):
                 subarray = mean_dis24.isel(forecast_period=i, forecast_reference_time=j)
                 band_data = subarray.values
                 forecast_period_int = int(forecast_period_value.values)
@@ -204,10 +200,10 @@ def clip_y_generar_geotiffs(archivo_nc):
                 subir_archivo_a_github("frontend/public/geotiff/resultados", output_tif)
 
     except Exception as e:
-        print(f"Error en clip_y_generar_geotiffs: {e}")
+        print(f"Error en generar_geotiffs: {e}")
 
 # Función principal
 if __name__ == "__main__":
     archivo_nc = fetch_rlevel(day, month, year)
     if archivo_nc:
-        clip_y_generar_geotiffs(archivo_nc)
+        generar_geotiffs(archivo_nc)
